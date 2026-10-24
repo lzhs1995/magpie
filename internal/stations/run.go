@@ -117,10 +117,12 @@ func Start(ctx context.Context, f File, s Station, exe string) (int, error) {
 	args := []string{"serve"}
 	env := append(os.Environ(), "XDG_CONFIG_HOME="+folder, "MAGPIE_ADDR="+s.Addr())
 	if s.WebPort != 0 {
-		if err := ensureKey(folder); err != nil {
-			return 0, err
+		if s.KeyFile == "" {
+			if err := ensureKey(folder); err != nil {
+				return 0, err
+			}
 		}
-		key, err := Key(folder)
+		key, err := KeyOf(s, f.Root)
 		if err != nil {
 			return 0, err
 		}
