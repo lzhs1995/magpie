@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"net/http"
 	"slices"
 	"sort"
 	"strconv"
@@ -189,6 +190,13 @@ type Runtime struct {
 	services map[string]any
 	// reconciled is set once Reconcile has run
 	reconciled bool
+	// the plugins' own routes (routes.go), under RoutePrefix: routes is
+	// the matcher, routed the handler each pattern has now, and mounted
+	// the patterns the matcher already holds, since a ServeMux takes a
+	// pattern once and never gives it back.
+	routes  *http.ServeMux
+	routed  map[string]http.Handler
+	mounted map[string]bool
 }
 
 // New is a runtime of the registered plugins, none applied yet.
