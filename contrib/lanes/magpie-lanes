@@ -665,12 +665,28 @@ def cmd_routing(lanes, argv):
             except ValueError:
                 data = {}
             if data:
-                print("    当前黏性（affinity.json，%d 条）:" % len(data))
-                for k, v in list(data.items())[:6]:
-                    sess = k.split("|")[-1][:8]
-                    print("      会话 %-9s → %-24s 第 %s 轮  %s"
-                          % (sess, str(v.get("who", "?")).split("#")[-1][:22],
-                             v.get("turn", "?"), str(v.get("at", ""))[11:19]))
+                # affinity 的键是 provider/model|session，所以同一会话换模型会多出
+                # 一行，而那一行可能落在**另一个 provider 的 key** 上 —— 那就是本
+                # lane 的 fallback 链在工作。provider 必须显示出来，否则只看 key
+                # 后缀看不出转移。实测：会话 33e14242 的 claude-opus-5-5 走
+                # linxi#068504e112，而它的 claude-opus-5 走 0-08#1330f3663c。
+                print("    当前黏性（affinity.json，%d 条）—— 键是 provider/model|会话:" % len(data))
+                moved = collections.defaultdict(set)
+                for k, v in sorted(data.items(), key=lambda kv: str(kv[1].get("at", "")), reverse=True)[:8]:
+                    pm, _, sess = k.rpartition("|")
+                    who = str(v.get("who", "?"))
+                    owner = who.split("#")[0] if "#" in who else who
+                    home = pm.split("/")[0]
+                    flag = "  ← 转到后备 provider" if owner and owner != home else ""
+                    print("      %-34s 会话 %-9s → %-22s 第 %-3s 轮 %s%s"
+                          % (pm[:34], sess[:8], who[:22], v.get("turn", "?"),
+                             str(v.get("at", ""))[11:19], flag))
+                    moved[sess].add(owner)
+                multi = {s: o for s, o in moved.items() if len(o) > 1}
+                if multi:
+                    print("    同一会话跨 provider（本 lane 内，不越界）:")
+                    for s, owners in multi.items():
+                        print("      %s → %s" % (s[:8], ", ".join(sorted(owners))))
     return 0
 
 
