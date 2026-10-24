@@ -1,0 +1,21 @@
+# 对照用配置：故意让 gateway_port 撞上一条在跑的 lane 的 web 口。
+#
+# pinned_clients() 靠在 argv 里找 127.0.0.1:<port> 来发现被钉住的客户端，
+# 而 magpie 自己的 argv 带 --web=127.0.0.1:<web_port>。如果不按二进制路径
+# 把 magpie 自己排除掉，它就会被算成「钉着的客户端」。
+#
+# 平时不误报只因为网关口和 web 口的编号习惯不同 —— 那是巧合，不是保证。
+# 这份配置把巧合去掉：把 gateway_port 直接设成某条在跑的 lane 的 web 口。
+# 期望 pinned_clients 为空。只读，不启动任何进程。
+#
+# 用法（把 3446 换成你本机某条在跑 lane 的 web 口）:
+#   magpie-lanes --config tests/collision.toml status --json
+[defaults]
+binary = "/Applications/magpie.app/Contents/MacOS/magpie"
+station_root = "~/.config/magpie-stations"
+
+[lanes.collider]
+gateway_port = 3446
+web_port = 39099
+client = "test"
+desc = "撞号对照，不启动"
