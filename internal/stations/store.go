@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/yetone/magpie/internal/appdir"
@@ -152,7 +153,8 @@ func Add(s Station) (File, error) {
 	if err := MkdirFolder(folder); err != nil {
 		return File{}, err
 	}
-	if s.WebPort != 0 {
+	// a station that names its own KeyFile keeps the key it already has
+	if s.WebPort != 0 && s.KeyFile == "" {
 		if err := ensureKey(folder); err != nil {
 			return File{}, err
 		}
@@ -198,7 +200,8 @@ func Edit(name string, s Station) (File, error) {
 	if err := MkdirFolder(folder); err != nil {
 		return File{}, err
 	}
-	if s.WebPort != 0 {
+	// a station that names its own KeyFile keeps the key it already has
+	if s.WebPort != 0 && s.KeyFile == "" {
 		if err := ensureKey(folder); err != nil {
 			return File{}, err
 		}
@@ -296,4 +299,57 @@ func Key(folder string) (string, error) {
 		return "", err
 	}
 	return s.WebKey, nil
+}
+
+// KeyOf is a station's page key, from wherever that station keeps it: its
+// own SecretsFile, or the KeyFile it names, at the dotted KeyPath inside
+// it. A station that was set up by hand before this page existed keeps
+// its key where it already is; nothing here writes into that file.
+func KeyOf(s Station, root string) (string, error) {
+	if s.KeyFile == "" {
+		return Key(s.Folder(root))
+	}
+	p := s.KeyFile
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(s.Folder(root), p)
+	}
+	b, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("%s: the key file %s isn't there", s.Name, p)
+	}
+	if err != nil {
+		return "", err
+	}
+	var any1 any
+	if err := json.Unmarshal(b, &any1); err != nil {
+		return "", fmt.Errorf("%s: %w", p, err)
+	}
+	path := s.KeyPath
+	if path == "" {
+		path = "web_password"
+	}
+	v, err := dig(any1, path)
+	if err != nil {
+		return "", fmt.Errorf("%s in %s: %w", path, p, err)
+	}
+	key, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("%s in %s isn't text", path, p)
+	}
+	return key, nil
+}
+
+// dig walks a dotted path through decoded JSON.
+func dig(v any, path string) (any, error) {
+	for _, part := range strings.Split(path, ".") {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%q isn't inside an object", part)
+		}
+		v, ok = m[part]
+		if !ok {
+			return nil, fmt.Errorf("there is no %q", part)
+		}
+	}
+	return v, nil
 }
