@@ -103,11 +103,30 @@ func builtinConfig(list []builtinJSON) map[string]map[string]any {
 	return out
 }
 
+// pluginOwnRoutes serves the routes the active plugins registered
+// themselves (pluginrt.Ctx.Handle), apart from the core's own /api. The
+// runtime isn't there before the first Reconcile, and a route of a plugin
+// since turned off is gone: both are 404, as an unknown path is.
+type pluginOwnRoutes struct{}
+
+func (pluginOwnRoutes) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+	h := pluginrt.Running().Routes()
+	if h == nil {
+		http.NotFound(rw, r)
+		return
+	}
+	h.ServeHTTP(rw, r)
+}
+
 // builtinRoutes: GET /api/plugins/builtin is every built-in plugin; POST
 // {"id", "on"} switches one, kept in plugins.yml as the user's own choice,
 // and {"id", "config"} sets its settings, only as their schema allows.
 // One in use is refused off.
 func builtinRoutes(mux *http.ServeMux) {
+	// Every active plugin's own routes (pluginrt.Ctx.Handle). One handler
+	// for them all, which looks each request's route up as it comes, so a
+	// plugin turned on or off while magpie runs needs no remounting here.
+	mux.Handle(pluginrt.RoutePrefix, pluginOwnRoutes{})
 	mux.HandleFunc("GET /api/plugins/builtin", func(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, builtinsState())
 	})

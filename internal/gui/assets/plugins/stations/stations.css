@@ -1,0 +1,190 @@
+/* The Stations page: a card per gateway, on the app's own tokens so it
+   follows the theme as every other page does. */
+
+.st-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.st-head p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  max-width: 62ch;
+}
+.st-head .st-new {
+  margin-left: auto;
+  flex: none;
+}
+
+.st-list {
+  display: grid;
+  gap: 10px;
+}
+
+.st-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--card);
+}
+.st-card[data-state="busy"] {
+  border-color: var(--bad, #c4584f);
+}
+
+.st-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.st-name {
+  font-weight: 600;
+  font-size: 15px;
+}
+.st-note {
+  color: var(--muted);
+  font-size: 13px;
+}
+.st-acts {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* The state chip: its colour is the state, and the word beside it says
+   the same thing, so it reads the same without colour. */
+.st-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.st-chip::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.st-chip[data-state="up"] {
+  color: var(--good, #3f9a56);
+}
+.st-chip[data-state="busy"] {
+  color: var(--bad, #c4584f);
+}
+.st-chip[data-state="listening"] {
+  color: var(--warn, #b4821f);
+}
+
+.st-lock {
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+/* The lines a reader copies: the one that starts it, and the address a
+   client is pointed at. */
+.st-rows {
+  margin-top: 10px;
+  display: grid;
+  gap: 6px;
+}
+.st-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.st-row > label {
+  flex: none;
+  width: 9.5em;
+  color: var(--muted);
+  font-size: 12px;
+}
+.st-row code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: pre;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: var(--code, rgba(127, 127, 127, 0.12));
+}
+.st-row .icon {
+  flex: none;
+}
+
+.st-why {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--bad, #c4584f);
+}
+
+.st-empty {
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  padding: 28px 16px;
+  text-align: center;
+  color: var(--muted);
+}
+
+/* The + form, shown in place above the list. */
+.st-form {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: var(--card);
+  display: grid;
+  gap: 8px;
+}
+.st-form .st-fields {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.st-form label.st-field {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.st-form input[type="text"],
+.st-form input[type="number"] {
+  font: inherit;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: inherit;
+}
+.st-form input[name="name"] {
+  width: 14ch;
+}
+.st-form input[type="number"] {
+  width: 9ch;
+}
+.st-form input[name="note"] {
+  width: 24ch;
+}
+.st-form .st-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.st-form .st-foot .st-err {
+  color: var(--bad, #c4584f);
+  font-size: 12px;
+}
+.st-form .st-foot .st-go {
+  margin-left: auto;
+}
