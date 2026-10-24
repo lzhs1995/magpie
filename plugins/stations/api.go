@@ -232,7 +232,7 @@ func open(rw http.ResponseWriter, r *http.Request) {
 		fail(rw, fmt.Errorf("%s has no page: give it one in Edit", name))
 		return
 	}
-	key, err := stations.Key(s.Folder(f.Root))
+	key, err := stations.KeyOf(s, f.Root)
 	if err != nil {
 		fail(rw, err)
 		return

@@ -43,15 +43,25 @@
   font-weight: 600;
   font-size: 15px;
 }
+/* A note as long as a lane's description must not push the buttons off
+   the card: it gives way first, and shortens with an ellipsis. */
 .st-note {
   color: var(--muted);
   font-size: 13px;
+  flex: 1 1 12ch;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+/* The buttons stay reachable at any width: they are pushed right while
+   there is room, and take a line of their own once there isn't. */
 .st-acts {
   margin-left: auto;
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+  flex: 0 0 auto;
 }
 
 /* The state chip: its colour is the state, and the word beside it says
@@ -97,11 +107,22 @@
   margin-top: 10px;
   display: grid;
   gap: 6px;
+  /* a grid track is as wide as its widest item unless told otherwise:
+     without this a long launch line makes the whole page scroll
+     sideways instead of the code box doing it (#stations layout) */
+  min-width: 0;
+}
+.st-card,
+.st-list {
+  min-width: 0;
 }
 .st-row {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* a long line scrolls inside its own code box (below), so the row
+     itself never widens the page */
+  min-width: 0;
 }
 .st-row > label {
   flex: none;
@@ -115,9 +136,12 @@
   overflow-x: auto;
   white-space: pre;
   font-size: 12px;
-  padding: 5px 8px;
+  /* the window's scrollbar is always shown and sits inside the box, so
+     a line that scrolls needs room under it or the bar covers the text */
+  padding: 5px 8px 11px;
   border-radius: 6px;
   background: var(--code, rgba(127, 127, 127, 0.12));
+  scrollbar-width: thin;
 }
 .st-row .icon {
   flex: none;
