@@ -209,6 +209,16 @@ func serveCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	// --station=<name> runs that station in this process's place
+	// (station_cli.go): its folder, port and page key come from
+	// stations.yml, so the line a reader keeps is short.
+	args, station, err := stationFlag(args)
+	if err != nil {
+		return err
+	}
+	if station != "" {
+		return runStation(station, args)
+	}
 	web := ""
 	for _, a := range args {
 		switch {
@@ -220,7 +230,7 @@ func serveCmd(args []string) error {
 				return fmt.Errorf("magpie serve: --web=%s isn't host:port", web)
 			}
 		default:
-			return fmt.Errorf("magpie serve: unknown %q · magpie serve [--web[=host:port]] [--tls-cert <file> --tls-key <file>]", a)
+			return fmt.Errorf("magpie serve: unknown %q · magpie serve [--station=<name>] [--web[=host:port]] [--tls-cert <file> --tls-key <file>]", a)
 		}
 	}
 	proc.UserPath() // as magpie web's (#3803)
