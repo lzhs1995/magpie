@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -44,6 +45,14 @@ type Station struct {
 	Protected bool `yaml:"protected,omitempty" json:"protected"`
 	// Note is the reader's own line about what this station is for.
 	Note string `yaml:"note,omitempty" json:"note"`
+	// KeyFile and KeyPath name where a station already keeps its page
+	// key, for a station that was running before this page existed: the
+	// file, and the dotted path to the key inside it. Empty means the
+	// station's own SecretsFile, which Add writes. Nothing here ever
+	// writes a key into KeyFile — a station set up by hand owns its own
+	// credentials, and the page only reads them to open it.
+	KeyFile string `yaml:"keyFile,omitempty" json:"keyFile,omitempty"`
+	KeyPath string `yaml:"keyPath,omitempty" json:"keyPath,omitempty"`
 }
 
 // nameOK is a station's name: a folder name and a URL path both take it,
@@ -147,7 +156,41 @@ const (
 // clipboard, and a station renamed or moved doesn't leave a stale line in
 // someone's notes.
 func (s Station) Launch(exe, root string) string {
-	return Quote(exe) + " serve --station=" + Quote(s.Name)
+	return Quote(Command(exe)) + " serve --station=" + Quote(s.Name)
+}
+
+// Command is how to name this magpie on a line the reader keeps: its own
+// name when that name on the PATH is this same file, and its full path
+// when it isn't. A reader who has magpie installed copies `magpie serve
+// …`, and one running it from a folder of their own still gets a line
+// that works.
+func Command(exe string) string {
+	if exe == "" {
+		return "magpie"
+	}
+	base := filepath.Base(exe)
+	found, err := exec.LookPath(base)
+	if err != nil {
+		return exe
+	}
+	if sameFile(found, exe) {
+		return base
+	}
+	return exe
+}
+
+// sameFile says whether two paths are the same file, following symlinks:
+// /usr/local/bin/magpie is often a link to the one in the app.
+func sameFile(a, b string) bool {
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(fa, fb)
 }
 
 // Full is the same start written out, for a reader who wants no
