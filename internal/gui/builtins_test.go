@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -54,7 +56,10 @@ func TestBuiltinSwitch(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 			t.Fatal(err)
 		}
-		if len(out) != 14 {
+		// every registered plugin, counted from the registry rather than
+		// written here: a plugin added shouldn't fail this for the number
+		// alone, while what each one's switch does is still asserted below
+		if len(out) != len(pluginrt.Registered()) {
 			t.Fatalf("the built-ins: %+v", out)
 		}
 		for _, b := range out {
@@ -133,8 +138,20 @@ func TestBootSaysBuiltinsOff(t *testing.T) {
 	if err := pluginrt.Set("library", true); err != nil {
 		t.Fatal(err)
 	}
-	if b := boot(); !strings.Contains(b, `"featuresOff":["groups","otel","sessions","warmups"]`) {
-		t.Fatalf("Essentials picked: %s", b)
+	// the ones Essentials leaves off: every plugin that isn't Essential,
+	// but for the one switched on by hand just above. Taken from the
+	// registry so a plugin added is in it without this test being edited,
+	// and ordered as boot.js writes them.
+	var off []string
+	for _, m := range pluginrt.Registered() {
+		if !m.Essential && m.ID != "library" {
+			off = append(off, strconv.Quote(m.ID))
+		}
+	}
+	sort.Strings(off)
+	want := `"featuresOff":[` + strings.Join(off, ",") + `]`
+	if b := boot(); !strings.Contains(b, want) {
+		t.Fatalf("Essentials picked: want %s in %s", want, b)
 	}
 }
 
@@ -225,7 +242,10 @@ func TestBuiltinConfig(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/boot.js", nil))
-	if !strings.Contains(rec.Body.String(), `"pluginConfig":{"gateway":{"callsPage":50}}`) {
+	// the Gateway page's setting as it was just set. Another plugin with
+	// settings of its own is in pluginConfig too, so this looks for the
+	// one it set rather than the whole object.
+	if !strings.Contains(rec.Body.String(), `"gateway":{"callsPage":50}`) {
 		t.Fatalf("boot.js: %s", rec.Body)
 	}
 }
