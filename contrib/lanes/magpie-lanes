@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""magpie-lanes —— 一条命令管所有通道（Phase 2）.
+
+一条 lane = 一个 magpie 进程 + 它专属的一组 key。故障转移只在这组 key 内部
+发生，永不越界到别的 lane。隔离靠进程级 XDG_CONFIG_HOME，不靠 magpie 配置
+—— magpie 一个进程只有一个 GatewayAddr()，而 affinity 会在 key 歇着或快用完
+时把会话转给同进程的下一个 key（internal/gateway/affinity.go）。
+
+magpie 本体零改动。本工具只读 lanes.toml、只起/停进程、只看监听端口。
+
+    magpie-lanes status            # 只读，全部 lane 现状
+    magpie-lanes up <lane>|--all   # 已在监听则 no-op
+    magpie-lanes down <lane>       # protected 的 lane 要 --force
+    magpie-lanes logs <lane> [-n N]
+"""
+
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# tomllib 要 3.11+。系统 python3 是 3.9，所以找一个带 tomllib 的重新 exec。
+# 不自己手搓 TOML 解析器：两条解析路径必然分叉。
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - bootstrap path
+    if os.environ.get("_MAGPIE_LANES_REEXEC"):
+        sys.exit("magpie-lanes: 重新 exec 后依然没有 tomllib，放弃")
+    for cand in ("python3.14", "python3.13", "python3.12", "python3.11",
+                 "/opt/homebrew/bin/python3"):
+        exe = cand if os.path.sep in cand else None
+        if exe is None:
+            from shutil import which
+            exe = which(cand)
+        if not exe:
+            continue
+        probe = subprocess.run([exe, "-c", "import tomllib"],
+                               capture_output=True)
+        if probe.returncode == 0:
+            os.environ["_MAGPIE_LANES_REEXEC"] = "1"
+            os.execv(exe, [exe, os.path.abspath(__file__)] + sys.argv[1:])
+    sys.exit("magpie-lanes: 需要 Python 3.11+（tomllib）。装一个或指定解释器。")
+
+HERE = Path(__file__).resolve().parent
+
+# 配置查找顺序。真实 lanes.toml 带本机站点路径，**不进仓库**——
+# 仓库里只有 lanes.toml.example。
+CONFIG_CANDIDATES = (
+    os.environ.get("MAGPIE_LANES_CONFIG"),
+    str(Path.home() / ".config" / "magpie-stations" / "lanes.toml"),
+    str(HERE / "lanes.toml"),
+)
+
+
+def default_config():
+    for cand in CONFIG_CANDIDATES:
+        if cand and Path(cand).expanduser().exists():
+            return Path(cand).expanduser().resolve()
+    # 一个都没有：返回首选位置，让 load_config 报出完整的查找链。
+    return Path(CONFIG_CANDIDATES[1]).expanduser()
+
+# 日志/输出里凡像 key 的都抹掉。magpie 启动横幅会把 MAGPIE_WEB_KEY 印在
+# 管理台 URL 的 ?k= 里。
+REDACTIONS = (
+    (re.compile(r"\?k=[A-Za-z0-9_\-]+"), "?k=<WEBKEY>"),
+    (re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_\-]{16,}"), "sk-<REDACTED>"),
+)
+
+
+def redact(text):
+    for pat, repl in REDACTIONS:
+        text = pat.sub(repl, text)
+    return text
+
+
+class ConfigError(Exception):
+    pass
+
+
+class Lane:
+    """一条 lane 的声明 + 它派生出来的全部路径和环境变量。"""
+
+    def __init__(self, name, spec, defaults):
+        self.name = name
+        self.desc = spec.get("desc", "")
+        self.client = spec.get("client", "unknown")
+        for field in ("gateway_port", "web_port"):
+            if field not in spec:
+                raise ConfigError("lane %s 缺 %s" % (name, field))
+            if not isinstance(spec[field], int):
+                raise ConfigError("lane %s 的 %s 必须是整数" % (name, field))
+        self.gateway_port = spec["gateway_port"]
+        self.web_port = spec["web_port"]
+        self.protected = bool(spec.get("protected", defaults.get("protected", False)))
+        # optional 的 lane 不参与退出码。常态是停着的（比如自检用的 sandbox），
+        # 否则 status 会永远返回非零，脚本里没法用。
+        self.optional = bool(spec.get("optional", defaults.get("optional", False)))
+
+        # expanduser：example 配置里写的是 ~/.config/...，Path() 自己不展开。
+        self.binary = Path(defaults["binary"]).expanduser()
+        root = Path(defaults["station_root"]).expanduser()
+        self.station_root = root
+        # 站点目录与缓存目录由 lane 名派生，跟现有 7 个脚本的布局逐字一致。
+        self.station = root / name
+        self.cache = root / (name + "-cache")
+        self.log = self.station / "serve.log"
+        self.pid_file = self.station / "serve.pid"
+        self.providers = self.station / "magpie" / "providers.json"
+
+        wk = spec.get("web_key") or {}
+        self.web_key_file = wk.get("file", "station")
+        self.web_key_path = wk.get("path", "web_password")
+        if self.web_key_file not in ("root", "station"):
+            raise ConfigError("lane %s 的 web_key.file 只能是 root 或 station" % name)
+
+        self.strip_proxy_env = list(defaults.get("strip_proxy_env", ()))
+        self.no_proxy = defaults.get("no_proxy", "127.0.0.1,localhost,::1")
+        self.no_accounts = bool(defaults.get("no_accounts", True))
+        self.require_providers = bool(defaults.get("require_providers", True))
+
+    # ---------------------------------------------------------------- 凭据
+    def credentials_file(self):
+        if self.web_key_file == "root":
+            return self.station_root / "CREDENTIALS.json"
+        return self.station / "CREDENTIALS.json"
+
+    def web_key(self):
+        """读 web 口令。只读；缺了就报错，绝不生成、绝不覆盖。
+
+        两种 schema 都支持：root 文件是 {lane: {web_password: ...}} 的嵌套，
+        station 文件是 {web_password: ...} 的扁平。不准改这两个格式。
+        """
+        path = self.credentials_file()
+        if not path.exists():
+            raise ConfigError("lane %s 的凭据文件不存在: %s" % (self.name, path))
+        try:
+            data = json.loads(path.read_text())
+        except ValueError as exc:
+            raise ConfigError("lane %s 的凭据文件不是合法 JSON: %s" % (self.name, exc))
+        cur = data
+        for part in self.web_key_path.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                raise ConfigError("lane %s 在 %s 里找不到键 %s"
+                                  % (self.name, path, self.web_key_path))
+            cur = cur[part]
+        if not isinstance(cur, str) or not cur:
+            raise ConfigError("lane %s 的 %s 不是非空字符串"
+                              % (self.name, self.web_key_path))
+        return cur
+
+    # ---------------------------------------------------------------- 环境
+    def child_env(self):
+        env = dict(os.environ)
+        # 先剥代理再设 NO_PROXY。少了这步，到 127.0.0.1 的请求会被交给
+        # .zshrc 里的 127.0.0.1:7897，表现为 502 Bad Gateway。
+        for var in self.strip_proxy_env:
+            env.pop(var, None)
+        env["NO_PROXY"] = self.no_proxy
+        env["no_proxy"] = self.no_proxy
+        env["XDG_CONFIG_HOME"] = str(self.station)
+        env["XDG_CACHE_HOME"] = str(self.cache)
+        env["MAGPIE_ADDR"] = "127.0.0.1:%d" % self.gateway_port
+        env["MAGPIE_WEB_KEY"] = self.web_key()
+        if self.no_accounts:
+            env["MAGPIE_NO_ACCOUNTS"] = "1"
+        return env
+
+    def argv(self):
+        return [str(self.binary), "serve", "--web=127.0.0.1:%d" % self.web_port]
+
+
+# -------------------------------------------------------------------- 实测
+def listener(port):
+    """谁在听这个端口。返回 (pid, comm) 或 None。
+
+    lsof 的选择条件默认是 OR —— 必须加 -a 才是 AND，否则 -iTCP 和 -sTCP
+    会被当成两个独立条件，列出一堆无关的打开文件。
+    """
+    proc = subprocess.run(
+        ["lsof", "-nP", "-a", "-iTCP:%d" % port, "-sTCP:LISTEN"],
+        capture_output=True, text=True)
+    for line in proc.stdout.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2:
+            return (int(fields[1]), fields[0])
+    return None
+
+
+def port_connectable(port, timeout=2.0):
+    """端口能不能真的连上。有监听 ≠ 能握手。"""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def process_start_epoch(pid):
+    proc = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                          capture_output=True, text=True)
+    stamp = proc.stdout.strip()
+    if not stamp:
+        return None
+    try:
+        return time.mktime(time.strptime(stamp))
+    except ValueError:
+        return None
+
+
+_PINNED_PORT = re.compile(r"127\.0\.0\.1:(\d{4})")
+
+
+def pinned_clients(binary=None):
+    """哪些客户端进程被钉在哪个 lane 端口上。
+
+    返回 {port: [pid, ...]}。客户端（codex 的 -c base_url=...）在启动时就把
+    端口写死了，之后不会重新解析 —— 网关死掉它也不知道，每个请求都往一个
+    没人听的端口打。今天 15:09:36-15:50:40 那 41 分钟就是这个形态。
+
+    只取匹配到的端口号，绝不回传 argv：codex 的 argv 里有 bearer token。
+    """
+    proc = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True,
+                          text=True)
+    found = {}
+    self_pid = os.getpid()
+    binary = str(binary) if binary else None
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_text, args = parts
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == self_pid:
+            continue
+        # 排除自己和 ps 本身造出来的回声：探针会匹配到自己的命令行。
+        if "magpie-lanes" in args or args.startswith("ps "):
+            continue
+        # 排除 magpie 自己。它的 argv 带 --web=127.0.0.1:<web_port>，
+        # 今天不误报只因为网关口结尾 5、web 口结尾 6 —— 那是编号巧合。
+        # 一旦某条 lane 的 gateway_port 撞上另一条的 web_port，magpie 自己
+        # 就会被算成「钉着的客户端」。按二进制路径排除，不靠巧合。
+        if binary and args.startswith(binary):
+            continue
+        for port_text in set(_PINNED_PORT.findall(args)):
+            found.setdefault(int(port_text), []).append(pid)
+    return found
+
+
+# -------------------------------------------------------------------- 配置
+def load_config(path):
+    if not path.exists():
+        chain = "\n".join("  - %s" % c for c in CONFIG_CANDIDATES if c)
+        raise ConfigError(
+            "找不到配置。按这个顺序找过了:\n%s\n"
+            "照 lanes.toml.example 建一份，或设 MAGPIE_LANES_CONFIG。" % chain)
+    with path.open("rb") as handle:
+        raw = tomllib.load(handle)
+    defaults = raw.get("defaults", {})
+    for field in ("binary", "station_root"):
+        if field not in defaults:
+            raise ConfigError("[defaults] 缺 %s" % field)
+    lane_specs = raw.get("lanes", {})
+    if not lane_specs:
+        raise ConfigError("配置里没有任何 lane")
+    lanes = {}
+    seen_ports = {}
+    for name, spec in lane_specs.items():
+        lane = Lane(name, spec, defaults)
+        for port, kind in ((lane.gateway_port, "gateway"), (lane.web_port, "web")):
+            if port in seen_ports:
+                raise ConfigError("端口 %d 被 %s 和 %s 同时声明"
+                                  % (port, seen_ports[port], name))
+            seen_ports[port] = name
+        lanes[name] = lane
+    return lanes
+
+
+def resolve(lanes, names, allow_all=True):
+    if not names:
+        raise SystemExit("要指定 lane 名，或 --all")
+    if list(names) == ["--all"]:
+        if not allow_all:
+            raise SystemExit("这个子命令不接受 --all")
+        return list(lanes.values())
+    picked = []
+    for name in names:
+        if name not in lanes:
+            raise SystemExit("没有这条 lane: %s（已知: %s）"
+                             % (name, ", ".join(sorted(lanes))))
+        picked.append(lanes[name])
+    return picked
+
+
+# -------------------------------------------------------------------- 子命令
+def cmd_status(lanes, argv):
+    """只读。不起、不停、不碰任何进程。"""
+    as_json = "--json" in argv
+    any_lane = next(iter(lanes.values())) if lanes else None
+    pinned = pinned_clients(any_lane.binary if any_lane else None)
+    now = time.time()
+    rows = []
+    for name in sorted(lanes):
+        lane = lanes[name]
+        who = listener(lane.gateway_port)
+        web = listener(lane.web_port)
+        stranded = pinned.get(lane.gateway_port, [])
+        row = {
+            "lane": name,
+            "client": lane.client,
+            "gateway_port": lane.gateway_port,
+            "web_port": lane.web_port,
+            "protected": lane.protected,
+            "optional": lane.optional,
+            "pid": who[0] if who else None,
+            "web_pid": web[0] if web else None,
+            "connectable": port_connectable(lane.gateway_port) if who else False,
+            "pinned_clients": sorted(stranded),
+            "providers_present": lane.providers.exists(),
+            "measured_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
+        }
+        if who:
+            started = process_start_epoch(who[0])
+            row["uptime_sec"] = int(now - started) if started else None
+            if row["connectable"]:
+                row["state"] = "UP"
+            else:
+                # 在听但连不上：进程还在，握手不通。
+                row["state"] = "LISTENING_NOT_CONNECTABLE"
+        else:
+            row["uptime_sec"] = None
+            # 死了还有客户端钉着 = 今天 41 分钟那次的形态。
+            row["state"] = "STRANDED" if stranded else "DOWN"
+        rows.append(row)
+
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+
+    print("%-15s %-11s %-7s %-6s %-9s %-7s %s"
+          % ("LANE", "CLIENT", "GATEWAY", "WEB", "STATE", "PID", "NOTE"))
+    worst = 0
+    for row in rows:
+        note = []
+        if row["protected"]:
+            note.append("protected")
+        if row["uptime_sec"] is not None:
+            note.append("up %dm" % (row["uptime_sec"] // 60))
+        if row["pinned_clients"]:
+            note.append("%d 个客户端钉着" % len(row["pinned_clients"]))
+        if not row["providers_present"]:
+            note.append("无 providers.json")
+        print("%-15s %-11s %-7d %-6d %-9s %-7s %s"
+              % (row["lane"], row["client"], row["gateway_port"], row["web_port"],
+                 row["state"], row["pid"] if row["pid"] else "-", " · ".join(note)))
+        # STRANDED 永远计入 —— 哪怕 lane 是 optional，有客户端钉在死端口上
+        # 就是真问题。单纯 DOWN 的 optional lane 不计入。
+        if row["state"] == "STRANDED":
+            worst = max(worst, 2)
+        elif row["state"] != "UP" and not row["optional"]:
+            worst = max(worst, 1)
+
+    stranded = [r for r in rows if r["state"] == "STRANDED"]
+    if stranded:
+        print()
+        print("STRANDED：网关已死，但这些客户端进程仍把请求往它的端口上打，")
+        print("          每个请求都 connection refused，表现为对端完全沉默。")
+        for row in stranded:
+            print("  %s（:%d）钉着的 pid: %s"
+                  % (row["lane"], row["gateway_port"],
+                     ", ".join(str(p) for p in row["pinned_clients"])))
+            print("    拉回来: magpie-lanes up %s" % row["lane"])
+    return worst
+
+
+def cmd_up(lanes, argv):
+    targets = resolve(lanes, [a for a in argv if not a.startswith("-")] or
+                      (["--all"] if "--all" in argv else []))
+    dry = "--dry-run" in argv
+    failed = 0
+    for lane in targets:
+        who = listener(lane.gateway_port)
+        if who:
+            # 已在监听就 no-op。绝不碰正在跑的进程。
+            print("%s 已在监听 127.0.0.1:%d pid=%d —— 不动它"
+                  % (lane.name, lane.gateway_port, who[0]))
+            continue
+        # 起之前把前置条件全查完，不让进程跑起来再 502。
+        problems = []
+        if not lane.binary.exists():
+            problems.append("二进制不存在: %s" % lane.binary)
+        if not lane.station.is_dir():
+            problems.append("站点目录不存在: %s" % lane.station)
+        if lane.require_providers and not lane.providers.exists():
+            problems.append("没有 providers.json: %s" % lane.providers)
+        web_who = listener(lane.web_port)
+        if web_who:
+            problems.append("web 口 %d 被 pid %d 占着" % (lane.web_port, web_who[0]))
+        try:
+            env = lane.child_env()
+        except ConfigError as exc:
+            problems.append(str(exc))
+            env = None
+        if problems:
+            print("%s 拒启:" % lane.name)
+            for item in problems:
+                print("   - %s" % item)
+            failed += 1
+            continue
+        if dry:
+            print("%s [dry-run] 会执行: %s" % (lane.name, " ".join(
+                shlex.quote(a) for a in lane.argv())))
+            print("   XDG_CONFIG_HOME=%s" % lane.station)
+            print("   MAGPIE_ADDR=127.0.0.1:%d  web=127.0.0.1:%d"
+                  % (lane.gateway_port, lane.web_port))
+            print("   剥掉的代理变量: %s" % (", ".join(lane.strip_proxy_env) or "(无)"))
+            print("   MAGPIE_WEB_KEY=<从 %s 读到，%d 字符>"
+                  % (lane.credentials_file(), len(env["MAGPIE_WEB_KEY"])))
+            continue
+
+        lane.cache.mkdir(parents=True, exist_ok=True)
+        handle = open(lane.log, "ab", buffering=0)
+        try:
+            proc = subprocess.Popen(
+                lane.argv(), env=env, cwd=str(lane.station),
+                stdin=subprocess.DEVNULL, stdout=handle, stderr=handle,
+                start_new_session=True)
+        finally:
+            handle.close()
+        lane.pid_file.write_text("%d\n" % proc.pid)
+
+        # 等它真的开始听。落盘 pid ≠ 在服务。
+        deadline = time.time() + 15.0
+        bound = None
+        while time.time() < deadline:
+            bound = listener(lane.gateway_port)
+            if bound and bound[0] == proc.pid:
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.3)
+        if bound and bound[0] == proc.pid and port_connectable(lane.gateway_port):
+            print("%s 起来了 pid=%d" % (lane.name, proc.pid))
+            print("   网关: http://127.0.0.1:%d" % lane.gateway_port)
+            print("   管理台: http://127.0.0.1:%d" % lane.web_port)
+        else:
+            rc = proc.poll()
+            print("%s 启动未确认（pid=%d, exit=%s）。日志尾部:"
+                  % (lane.name, proc.pid, rc))
+            print(redact(tail(lane.log, 12)))
+            failed += 1
+    return 1 if failed else 0
+
+
+def cmd_down(lanes, argv):
+    force = "--force" in argv
+    targets = resolve(lanes, [a for a in argv if not a.startswith("-")] or
+                      (["--all"] if "--all" in argv else []), allow_all=force)
+    failed = 0
+    for lane in targets:
+        if lane.protected and not force:
+            print("%s 是 protected —— 拒绝停。它在跑生产任务。" % lane.name)
+            print("   真要停: magpie-lanes down %s --force" % lane.name)
+            failed += 1
+            continue
+        who = listener(lane.gateway_port)
+        if not who:
+            print("%s 本来就没在听 —— 无事可做" % lane.name)
+            continue
+        pid = who[0]
+        os.kill(pid, 15)
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if not listener(lane.gateway_port):
+                break
+            time.sleep(0.3)
+        if listener(lane.gateway_port):
+            print("%s SIGTERM 后 10 秒仍在听 pid=%d —— 没有升级到 SIGKILL，"
+                  "自己决定" % (lane.name, pid))
+            failed += 1
+        else:
+            print("%s 停了（pid=%d）" % (lane.name, pid))
+            if lane.pid_file.exists():
+                lane.pid_file.unlink()
+    return 1 if failed else 0
+
+
+def tail(path, count):
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+    except OSError as exc:
+        return "(读不到 %s: %s)" % (path, exc)
+    return "\n".join(lines[-count:])
+
+
+def cmd_logs(lanes, argv):
+    count = 40
+    rest = []
+    iterator = iter(argv)
+    for arg in iterator:
+        if arg in ("-n", "--lines"):
+            count = int(next(iterator))
+        else:
+            rest.append(arg)
+    for lane in resolve(lanes, rest):
+        print("===== %s  %s =====" % (lane.name, lane.log))
+        print(redact(tail(lane.log, count)))
+    return 0
+
+
+USAGE = __doc__
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    config = default_config()
+    if "--config" in argv:
+        idx = argv.index("--config")
+        config = Path(argv[idx + 1]).expanduser().resolve()
+        argv = argv[:idx] + argv[idx + 2:]
+    command, rest = argv[0], argv[1:]
+    try:
+        lanes = load_config(config)
+    except ConfigError as exc:
+        print("配置有问题: %s" % exc, file=sys.stderr)
+        return 2
+    handlers = {"status": cmd_status, "up": cmd_up, "down": cmd_down,
+                "logs": cmd_logs}
+    if command not in handlers:
+        print("不认识的子命令: %s\n\n%s" % (command, USAGE), file=sys.stderr)
+        return 2
+    try:
+        return handlers[command](lanes, rest)
+    except ConfigError as exc:
+        print("出错: %s" % exc, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

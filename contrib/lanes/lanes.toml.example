@@ -1,0 +1,88 @@
+# magpie lanes —— 通道清单（示例）
+#
+# 复制到 ~/.config/magpie-stations/lanes.toml 再改。真配置别放仓库里。
+#
+# 一条 lane = 一个 magpie 进程 + 它专属的一组 key + 故障转移只在这组 key
+# 内部发生，永不越界到别的 lane。隔离靠进程级 XDG_CONFIG_HOME，不靠 magpie
+# 配置 —— 一个进程只有一个 settings.GatewayAddr()，而 affinity 会在 key
+# 歇着或快用完时把会话转给同进程的下一个 key（internal/gateway/affinity.go）。
+
+[defaults]
+binary = "/Applications/magpie.app/Contents/MacOS/magpie"
+
+# 每条 lane 的站点目录是 <station_root>/<lane 名>，
+# 缓存目录是 <station_root>/<lane 名>-cache。按 lane 名派生，不用逐条写。
+station_root = "~/.config/magpie-stations"
+
+# 必须剥干净代理，否则到 127.0.0.1 的请求会被交给 shell 里的 HTTP(S)_PROXY，
+# 表现为 502 Bad Gateway。实测：不带 NO_PROXY 时 29/29 次采样全连代理、
+# 0 次连网关。
+strip_proxy_env = [
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+  "http_proxy", "https_proxy", "all_proxy",
+]
+no_proxy = "127.0.0.1,localhost,::1"
+
+# MAGPIE_NO_ACCOUNTS=1：不走账号池，只用 providers.json 里的 key。
+no_accounts = true
+
+# 没有 providers.json 就拒启，不让进程跑起来再 502。
+require_providers = true
+
+# 默认不保护。生产 lane 自己标 protected = true。
+protected = false
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 每条 lane 一个 [lanes.<名>]。名字决定站点目录，所以别随便改。
+# 端口自己排开，同一份配置里重复声明会被拒。
+# ─────────────────────────────────────────────────────────────────────
+
+#
+# 下面的端口是占位值，**用之前必须改成你自己的**。
+# 别让示例端口撞上在跑的真网关：撞上了 status 会把别人的进程显示成这条
+# lane 的，而 down --force 会打到那个进程上。
+
+[lanes.example-a]
+gateway_port = 39001      # 客户端连这个
+web_port = 39002          # 管理台 / routing 视图
+client = "claude-code"    # 自由文本，只用于 status 显示
+protected = true          # 在跑生产任务 -> down 要 --force
+desc = "第一条通道"
+
+[lanes.example-a.web_key]
+# MAGPIE_WEB_KEY 从哪读。只读 —— 工具绝不创建、绝不覆盖凭据文件。
+#
+# file = "root"    读 <station_root>/CREDENTIALS.json
+# file = "station" 读 <station_root>/<lane 名>/CREDENTIALS.json
+#
+# path 是点分键路径，所以两种 schema 都能表达，不用改既有文件格式：
+#   嵌套: {"example-a": {"web_password": "..."}}  -> path = "example-a.web_password"
+#   扁平: {"web_password": "..."}                  -> path = "web_password"
+file = "root"
+path = "example-a.web_password"
+
+[lanes.example-b]
+gateway_port = 39011
+web_port = 39012
+client = "codex"
+protected = true
+desc = "第二条通道，另一组 key，与第一条永不互为后备"
+
+[lanes.example-b.web_key]
+file = "station"
+path = "web_password"
+
+
+# 自检用。tests/test_lifecycle.sh 只动这条，不要标 protected。
+[lanes.sandbox]
+gateway_port = 39021
+web_port = 39022
+client = "test"
+protected = false
+optional = true          # 常态停着，不计入 status 的退出码
+desc = "supervisor 自检用，不接生产流量"
+
+[lanes.sandbox.web_key]
+file = "station"
+path = "web_password"
