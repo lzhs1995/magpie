@@ -8,12 +8,21 @@
 
 magpie 本体零改动。本工具只读 lanes.toml、只起/停进程、只看监听端口。
 
+建网关 → 用网关 → 看路由 → 改配置，一条命令一步：
+
+    magpie-lanes new <名>          # 建一条新 lane（目录+凭据+providers 骨架+写配置）
+    magpie-lanes edit <lane>       # 改上游地址/key/路由顺序（改完 1 秒生效，不用重启）
+    magpie-lanes keys <lane>       # 这条 lane 有哪些 provider 和 key
+    magpie-lanes up <lane>|--all   # 起它。已在监听则 no-op
+    magpie-lanes use <lane>        # 把客户端接进这条 lane 的完整命令
+    magpie-lanes routing <lane>    # 终端里看路由：谁答的、几毫秒、重试几次
+    magpie-lanes open <lane>       # 带 key 的管理台/routing 视图 URL
     magpie-lanes status            # 只读，全部 lane 现状
-    magpie-lanes up <lane>|--all   # 已在监听则 no-op
-    magpie-lanes down <lane>       # protected 的 lane 要 --force
     magpie-lanes logs <lane> [-n N]
+    magpie-lanes down <lane>       # protected 的 lane 要 --force
 """
 
+import collections
 import json
 import os
 import re
@@ -283,6 +292,29 @@ def load_config(path):
     return lanes
 
 
+# 带值的参数。它们的值不以 - 开头，所以必须显式剥掉，
+# 否则会被当成 lane 名（实测 `new x --client codex` 把 codex 认成第二个名字）。
+VALUED_FLAGS = ("--client", "--gateway-port", "--web-port", "--view", "-n",
+                "--lines", "--config")
+
+
+def positional(argv):
+    """取出位置参数，剥掉选项及其值。"""
+    out = []
+    skip = False
+    for i, arg in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if arg in VALUED_FLAGS:
+            skip = True
+            continue
+        if arg.startswith("-"):
+            continue
+        out.append(arg)
+    return out
+
+
 def resolve(lanes, names, allow_all=True):
     if not names:
         raise SystemExit("要指定 lane 名，或 --all")
@@ -381,7 +413,7 @@ def cmd_status(lanes, argv):
 
 
 def cmd_up(lanes, argv):
-    targets = resolve(lanes, [a for a in argv if not a.startswith("-")] or
+    targets = resolve(lanes, positional(argv) or
                       (["--all"] if "--all" in argv else []))
     dry = "--dry-run" in argv
     failed = 0
@@ -461,7 +493,7 @@ def cmd_up(lanes, argv):
 
 def cmd_down(lanes, argv):
     force = "--force" in argv
-    targets = resolve(lanes, [a for a in argv if not a.startswith("-")] or
+    targets = resolve(lanes, positional(argv) or
                       (["--all"] if "--all" in argv else []), allow_all=force)
     failed = 0
     for lane in targets:
@@ -500,6 +532,449 @@ def tail(path, count):
     return "\n".join(lines[-count:])
 
 
+def upstream_url(prov):
+    """provider 的上游地址。
+
+    `baseAPI` 存的是 wire 格式名（"responses" / "anthropic"），**不是 URL**；
+    真 URL 在以那个名字命名的字段里。实测:
+      agentrouter-a: baseAPI="responses", responses="http://127.0.0.1:18765/v1"
+      linxi:         baseAPI="anthropic", anthropic="https://k40.shengqainbang.cn"
+    """
+    kind = prov.get("baseAPI")
+    if kind and isinstance(prov.get(kind), str):
+        return prov[kind]
+    for field in ("base_url", "baseUrl", "url", "endpoint"):
+        if isinstance(prov.get(field), str):
+            return prov[field]
+    return "?"
+
+
+def read_providers(lane):
+    """读一条 lane 的 providers.json，返回 [(provider, [(key名, key值), ...])]。
+
+    一个 provider 的 key 可能同时出现在顶层 `key` 和 `keys[]` 数组里
+    （实测 agentrouter-a 的 affinity.json 里就有两个不同的 key id）。
+    两处都读，按值去重，保持 keys[] 的顺序。
+    """
+    if not lane.providers.exists():
+        return []
+    try:
+        data = json.loads(lane.providers.read_text())
+    except ValueError as exc:
+        raise ConfigError("lane %s 的 providers.json 不是合法 JSON: %s" % (lane.name, exc))
+    items = data.get("providers", data) if isinstance(data, dict) else data
+    out = []
+    for prov in items if isinstance(items, list) else []:
+        if not isinstance(prov, dict):
+            continue
+        pairs, seen = [], set()
+        for entry in list(prov.get("keys") or []) + [prov]:
+            if not isinstance(entry, dict):
+                continue
+            val = entry.get("key")
+            if not val or val in seen:
+                continue
+            seen.add(val)
+            pairs.append((entry.get("name") or entry.get("keyName") or "(无名)", val))
+        out.append((prov, pairs))
+    return out
+
+
+def _routing_records(lane, want, max_bytes=4_000_000):
+    """读一条 lane 今天的 routing 日志尾部，返回最后 want 条记录。
+
+    日志能到几 MB（实测 agentrouter-a 今天 6.1 MB），所以只 seek 尾部，
+    不整文件进内存。第一行可能被切断，丢掉。
+    """
+    day = time.strftime("%Y-%m-%d")
+    path = lane.station / "magpie" / "routing" / ("%s.jsonl" % day)
+    if not path.exists():
+        return path, None
+    size = path.stat().st_size
+    with path.open("rb") as fh:
+        fh.seek(max(0, size - max_bytes))
+        chunk = fh.read()
+    lines = chunk.decode("utf-8", errors="replace").splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]
+    recs = []
+    for line in lines[-want * 3:]:
+        try:
+            recs.append(json.loads(line))
+        except ValueError:
+            continue
+    return path, recs[-want:]
+
+
+def cmd_routing(lanes, argv):
+    """终端里看路由：谁答的、几毫秒、多少 token、有没有重试。"""
+    count = 12
+    if "-n" in argv:
+        count = int(argv[argv.index("-n") + 1])
+    rest = positional(argv)
+    as_json = "--json" in argv
+
+    for lane in resolve(lanes, rest or ["--all"]):
+        path, recs = _routing_records(lane, count)
+        print("=== %s  （网关 :%d）" % (lane.name, lane.gateway_port))
+        if recs is None:
+            print("    今天还没有路由日志: %s" % path)
+            continue
+        if not recs:
+            print("    日志在，但尾部没有可解析的记录: %s" % path)
+            continue
+        if as_json:
+            print(json.dumps(recs, ensure_ascii=False, indent=2))
+            continue
+
+        # 本 lane 内各 key 的分担。affinity.last / tries[].id 才是真正答的 key。
+        by_key = collections.Counter()
+        errs = collections.Counter()
+        for r in recs:
+            for t in r.get("tries") or []:
+                if t.get("id"):
+                    by_key[t["id"]] += 1
+            if r.get("error"):
+                errs[str(r.get("status") or "err")] += 1
+
+        print("    %-8s %-6s %-22s %-7s %-6s %-9s %s"
+              % ("时刻", "状态", "key", "毫秒", "重试", "token", "会话/模型"))
+        for r in recs:
+            tries = r.get("tries") or []
+            who = (tries[-1].get("id") if tries else None) or "?"
+            stamp = (r.get("time") or "")[11:19]
+            sess = (r.get("session") or "")[:8]
+            retried = len(tries) - 1
+            print("    %-8s %-6s %-22s %-7s %-6s %-9s %s/%s"
+                  % (stamp, r.get("status", "-"), who.split("#")[-1][:20],
+                     r.get("ms", "-"), retried if retried > 0 else "",
+                     r.get("tokens", "-"), sess, r.get("model", "?")))
+
+        print()
+        print("    这 %d 条里各 key 的分担（本 lane 内部，不会越界到别的 lane）:" % len(recs))
+        for key, n in by_key.most_common():
+            print("      %-26s %d 次" % (key, n))
+        if errs:
+            print("    错误: %s" % ", ".join("%s×%d" % (k, v) for k, v in errs.most_common()))
+
+        # 当前黏性：哪个会话黏在哪个 key 上
+        aff = lane.station / "magpie" / "affinity.json"
+        if aff.exists():
+            try:
+                data = json.loads(aff.read_text())
+            except ValueError:
+                data = {}
+            if data:
+                print("    当前黏性（affinity.json，%d 条）:" % len(data))
+                for k, v in list(data.items())[:6]:
+                    sess = k.split("|")[-1][:8]
+                    print("      会话 %-9s → %-24s 第 %s 轮  %s"
+                          % (sess, str(v.get("who", "?")).split("#")[-1][:22],
+                             v.get("turn", "?"), str(v.get("at", ""))[11:19]))
+    return 0
+
+
+def cmd_open(lanes, argv):
+    """打印（或直接打开）每条 lane 的 routing 视图 URL，带上 web key。
+
+    管理台要 MAGPIE_WEB_KEY 才进得去，所以 URL 里必须带 ?k=。
+    这是本机 127.0.0.1 的管理口令，按用户规则明文完整给出。
+    """
+    launch = "--launch" in argv
+    view = "routing"
+    if "--view" in argv:
+        view = argv[argv.index("--view") + 1]
+    rest = positional(argv)
+    for lane in resolve(lanes, rest or ["--all"]):
+        try:
+            key = lane.web_key()
+        except ConfigError as exc:
+            print("%s: 读不到 web key —— %s" % (lane.name, exc))
+            continue
+        url = "http://127.0.0.1:%d/?k=%s&view=%s" % (lane.web_port, key, view)
+        live = listener(lane.web_port)
+        print("=== %s %s" % (lane.name, "" if live else "（没在跑，先 magpie-lanes up %s）" % lane.name))
+        print("  %s" % url)
+        print("  管理台密码（直接登录用）: %s" % key)
+        if launch and live:
+            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            print("  已在浏览器打开")
+    if not launch:
+        print()
+        print("直接开浏览器: magpie-lanes open <lane> --launch")
+    return 0
+
+
+# 客户端怎么接进一条 lane。两边都是「启动时固定」的：
+#   codex 用 -c 覆盖 base_url；Claude Code 读 ANTHROPIC_BASE_URL。
+# 所以换 lane 要重开客户端 —— 这不是本工具的限制，是客户端自己的。
+CLIENT_RECIPES = {
+    "codex": {
+        "env": {"NO_PROXY": "127.0.0.1,localhost,::1",
+                "no_proxy": "127.0.0.1,localhost,::1"},
+        "note": "codex 的 reqwest 会把 127.0.0.1 也交给 HTTP(S)_PROXY，"
+                "所以 NO_PROXY 必带，否则 502。",
+        "cmd": lambda lane: [
+            "env", "NO_PROXY=127.0.0.1,localhost,::1",
+            "no_proxy=127.0.0.1,localhost,::1", "codex",
+            "-c", 'model_providers.custom.base_url="http://127.0.0.1:%d/v1"'
+                  % lane.gateway_port],
+    },
+    "claude-code": {
+        # 形式取自本机在跑的真实链路，不是推的：
+        # Claude Code(ANTHROPIC_BASE_URL=http://127.0.0.1:<临时口>)
+        #   → sanitizer(--upstream http://127.0.0.1:3455) → magpie lane
+        # 两处都是**不带** /v1 的裸 host:port。
+        "note": "Claude Code 读 ANTHROPIC_BASE_URL，填裸 host:port，不要加 /v1 —— "
+                "客户端自己会接 /v1/messages。"
+                "本机现有会话是经 sanitizer 代理再进 lane 的；下面这条是直连。",
+        "cmd": lambda lane: [
+            "env", "ANTHROPIC_BASE_URL=http://127.0.0.1:%d" % lane.gateway_port,
+            "NO_PROXY=127.0.0.1,localhost,::1",
+            "no_proxy=127.0.0.1,localhost,::1", "claude"],
+    },
+}
+
+
+def cmd_use(lanes, argv):
+    """打印把客户端接进某条 lane 的完整命令。--run 直接起。"""
+    run = "--run" in argv
+    rest = positional(argv)
+    extra = []
+    if "--" in argv:
+        idx = argv.index("--")
+        extra = argv[idx + 1:]
+        rest = positional(argv[:idx])
+    targets = resolve(lanes, rest, allow_all=False)
+    for lane in targets:
+        kind = lane.client if lane.client in CLIENT_RECIPES else None
+        if kind is None:
+            print("%s 的 client 是 %r，我只知道怎么接 %s。"
+                  % (lane.name, lane.client, "/".join(sorted(CLIENT_RECIPES))))
+            print("  网关地址自己用: http://127.0.0.1:%d" % lane.gateway_port)
+            continue
+        recipe = CLIENT_RECIPES[kind]
+        if not listener(lane.gateway_port):
+            print("%s 的网关 :%d 没在听 —— 先 magpie-lanes up %s"
+                  % (lane.name, lane.gateway_port, lane.name))
+            continue
+        cmd = recipe["cmd"](lane) + extra
+        print("=== %s  →  %s（网关 :%d）" % (kind, lane.name, lane.gateway_port))
+        print("  %s" % recipe["note"])
+        print()
+        print("  " + " ".join(shlex.quote(a) for a in cmd))
+        print()
+        if run:
+            print("  起了。")
+            os.execvp(cmd[0], cmd)
+    if not run:
+        print("直接起: magpie-lanes use <lane> --run [-- 额外参数]")
+    return 0
+
+
+def cmd_keys(lanes, argv):
+    """列出每条 lane 的 provider 和 key。默认只显示末 4 位。"""
+    show = "--show-secrets" in argv
+    rest = positional(argv)
+    for lane in resolve(lanes, rest or ["--all"]):
+        print("=== %s  （网关 :%d）" % (lane.name, lane.gateway_port))
+        provs = read_providers(lane)
+        if not provs:
+            print("    没有 providers.json —— 用 magpie-lanes edit %s 建" % lane.name)
+            continue
+        for prov, pairs in provs:
+            flags = []
+            if prov.get("off"):
+                flags.append("已停用")
+            print("  provider %-16s id=%-14s routing=%-6s affinity=%-8s %s"
+                  % (prov.get("name", "?"), prov.get("id", "?"),
+                     prov.get("routing") or "-", prov.get("affinity") or "-",
+                     " ".join(flags)))
+            print("           上游 %s（%s）" % (upstream_url(prov), prov.get("baseAPI") or "?"))
+            if prov.get("fallback"):
+                print("           故障转移链 → %s" % ", ".join(prov["fallback"]))
+            caps = [("并发", prov.get("maxConcurrency")), ("RPM", prov.get("maxRPM")),
+                    ("排队上限", prov.get("queueLimit"))]
+            caps = ["%s=%s" % (k, v) for k, v in caps if v]
+            if caps:
+                print("           限额 %s" % " · ".join(caps))
+            if not pairs:
+                print("           （这个 provider 下没有 key —— 它不会被路由选中）")
+            for kname, kval in pairs:
+                shown = kval if show else "…%s（%d 字符）" % (kval[-4:], len(kval))
+                print("           key %-26s %s" % (kname, shown))
+        if not show:
+            print("    完整明文: magpie-lanes keys %s --show-secrets" % lane.name)
+    return 0
+
+
+def cmd_edit(lanes, argv):
+    """打开一条 lane 的 providers.json（改上游地址、key、路由顺序）。"""
+    rest = positional(argv)
+    targets = resolve(lanes, rest)
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    for lane in targets:
+        if not lane.providers.exists():
+            lane.providers.parent.mkdir(parents=True, exist_ok=True)
+            lane.providers.write_text(json.dumps({"providers": []}, indent=2))
+            print("建了空的 %s" % lane.providers)
+        print("%s 的 providers: %s" % (lane.name, lane.providers))
+        if "--print" in argv:
+            print(redact(lane.providers.read_text()) if "--show-secrets" not in argv
+                  else lane.providers.read_text())
+            continue
+        if not editor:
+            print("  没设 $EDITOR/$VISUAL。直接改上面这个路径，或:")
+            print("    magpie-lanes edit %s --print [--show-secrets]" % lane.name)
+            _check_providers(lane)
+            continue
+        subprocess.call([editor, str(lane.providers)])
+        _check_providers(lane)
+    return 0
+
+
+def _check_providers(lane):
+    """改完后校验，并说明生效时机。
+
+    不用重启。实测源码（internal/provider/hold.go）：
+      - heldOf:183 第一句 `if held.holds == 0 { return build() }`
+        —— 没有活动 hold 时每次调用都重新读文件。
+      - 有 hold 时 heldFor = time.Second（:109），缓存最多活 1 秒；
+        且 heldFreshLocked:56 按 stampOf(providers.json) 比对，
+        stampOf = (ModTime, Size)（:44），文件一变就清缓存。
+    所以改完最多 1 秒生效，且不需要重启进程。
+    """
+    try:
+        data = json.loads(lane.providers.read_text())
+    except ValueError as exc:
+        print("  ✗ JSON 坏了，magpie 会把它当「读不到」而不是空目录: %s" % exc)
+        print("    先修好再用，否则这条 lane 的 provider 列表是空的。")
+        return False
+    provs = data.get("providers", []) if isinstance(data, dict) else data
+    print("  ✓ JSON 合法，%d 个 provider" % len(provs or []))
+    empty = [p.get("name", "?") for p in (provs or [])
+             if isinstance(p, dict) and not p.get("key")
+             and not [k for k in (p.get("keys") or []) if k.get("key")]]
+    if empty:
+        print("  ! 这些 provider 没有 key，不会被路由选中: %s" % ", ".join(empty))
+    print("  生效：最多 1 秒，不用重启（provider 缓存 heldFor=1s，"
+          "且按 providers.json 的 mtime+size 失效）")
+    return True
+
+
+def _next_free_port_pair(lanes, start=3495):
+    """给新 lane 找一对没人用、也没被声明的端口。"""
+    taken = set()
+    for lane in lanes.values():
+        taken.add(lane.gateway_port)
+        taken.add(lane.web_port)
+    port = start
+    while port < 39000:
+        if (port not in taken and port + 1 not in taken
+                and not listener(port) and not listener(port + 1)):
+            return port, port + 1
+        port += 10
+    raise ConfigError("3495-39000 之间找不到空闲端口对")
+
+
+def cmd_new(lanes, argv):
+    """建一条新 lane：站点目录 + 凭据 + providers 骨架 + 写进 lanes.toml。
+
+    不碰任何在跑的进程。建完不自动启动 —— 先让你填 key。
+    """
+    import secrets
+
+    names = positional(argv)
+    if len(names) != 1:
+        raise SystemExit("用法: magpie-lanes new <lane 名> [--client codex|claude-code]\n"
+                         "      [--gateway-port N --web-port N] [--protected]")
+    name = names[0]
+    if name in lanes:
+        raise SystemExit("lane %s 已存在。改配置用 magpie-lanes edit %s" % (name, name))
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        raise SystemExit("lane 名只能用字母数字和 . _ -（它要当目录名）")
+
+    client = "codex"
+    if "--client" in argv:
+        client = argv[argv.index("--client") + 1]
+    if "--gateway-port" in argv:
+        gw = int(argv[argv.index("--gateway-port") + 1])
+        web = int(argv[argv.index("--web-port") + 1]) if "--web-port" in argv else gw + 1
+    else:
+        gw, web = _next_free_port_pair(lanes)
+    for port in (gw, web):
+        if listener(port):
+            raise SystemExit("端口 %d 已被占用，换一对" % port)
+        for other in lanes.values():
+            if port in (other.gateway_port, other.web_port):
+                raise SystemExit("端口 %d 已被 lane %s 声明" % (port, other.name))
+
+    sample = next(iter(lanes.values()))
+    station = sample.station_root / name
+    cache = sample.station_root / (name + "-cache")
+    if station.exists():
+        raise SystemExit("站点目录已存在，不覆盖: %s" % station)
+
+    (station / "magpie").mkdir(parents=True)
+    cache.mkdir(parents=True, exist_ok=True)
+
+    # 凭据：O_EXCL 建，0600。已存在就不动 —— 绝不覆盖凭据。
+    web_password = secrets.token_urlsafe(24)
+    cred = station / "CREDENTIALS.json"
+    fd = os.open(cred, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with open(fd, "w") as fh:
+        json.dump({"web_password": web_password}, fh, indent=2)
+
+    # providers 骨架。key 留空，magpie 不会拿它去请求。
+    # baseAPI 存 wire 格式名，URL 放在以那个名字命名的字段里（见 upstream_url）。
+    # codex 侧用 responses，Claude Code 侧用 anthropic。
+    wire = "anthropic" if client == "claude-code" else "responses"
+    providers = station / "magpie" / "providers.json"
+    providers.write_text(json.dumps({"providers": [{
+        "id": name, "name": name, "icon": "generic",
+        "keyName": "填你的 key 名",
+        "keys": [{"name": "填你的 key 名", "key": ""}],
+        "baseAPI": wire,
+        wire: "https://填上游地址",
+        "routing": "order", "affinity": "session",
+        "models": [],
+    }]}, ensure_ascii=False, indent=2))
+
+    # 追加进配置文件。用追加而非重写，保住你原有的注释和排版。
+    cfg = default_config()
+    block = [
+        "", "", "[lanes.%s]" % (name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else '"%s"' % name),
+        "gateway_port = %d" % gw,
+        "web_port = %d" % web,
+        'client = "%s"' % client,
+        "protected = %s" % ("true" if "--protected" in argv else "false"),
+        'desc = "由 magpie-lanes new 创建"',
+        "",
+        "[lanes.%s.web_key]" % (name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else '"%s"' % name),
+        'file = "station"',
+        'path = "web_password"',
+        "",
+    ]
+    with cfg.open("a") as fh:
+        fh.write("\n".join(block))
+
+    print("lane %s 建好了" % name)
+    print()
+    print("  站点目录   %s" % station)
+    print("  providers  %s" % providers)
+    print("  配置已追加 %s" % cfg)
+    print()
+    print("  网关口 %d · 管理台口 %d" % (gw, web))
+    print("  管理台密码: %s" % web_password)
+    print()
+    print("  下一步：")
+    print("    1. 填上游地址和 key:  magpie-lanes edit %s" % name)
+    print("    2. 起它:              magpie-lanes up %s" % name)
+    print("    3. 接客户端:          magpie-lanes use %s" % name)
+    return 0
+
+
 def cmd_logs(lanes, argv):
     count = 40
     rest = []
@@ -534,7 +1009,9 @@ def main(argv):
         print("配置有问题: %s" % exc, file=sys.stderr)
         return 2
     handlers = {"status": cmd_status, "up": cmd_up, "down": cmd_down,
-                "logs": cmd_logs}
+                "logs": cmd_logs, "new": cmd_new, "keys": cmd_keys,
+                "edit": cmd_edit, "open": cmd_open, "use": cmd_use,
+                "routing": cmd_routing}
     if command not in handlers:
         print("不认识的子命令: %s\n\n%s" % (command, USAGE), file=sys.stderr)
         return 2
