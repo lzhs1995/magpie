@@ -123,6 +123,35 @@ else
   bad "假客户端没活下来 —— 本项无效，不计为通过"
 fi
 
+# ---- 4b. 只读子命令（建网关→用网关→看路由→改配置 这条链） ----
+say "4b. 只读子命令"
+out=$("$CLI" keys "$PROTECTED_LANE" 2>&1)
+[[ "$out" == *"provider"* ]] && ok "keys 列出了 provider" || bad "keys 没列出 provider"
+# 默认必须遮掩。整条 key 的长度从 keys 自己报的字符数拿，别写死。
+[[ "$out" == *"字符）"* ]] && ok "keys 默认遮掩（只给末 4 位）" || bad "keys 默认没遮掩"
+[[ "$out" != *"--show-secrets "* || "$out" == *"完整明文"* ]] \
+  && ok "keys 指明了看明文的方式" || bad "keys 没说怎么看明文"
+
+out=$("$CLI" use "$PROTECTED_LANE" 2>&1)
+[[ "$out" == *"127.0.0.1:"* ]] && ok "use 给出了带网关口的命令" || bad "use 没给命令"
+[[ "$out" == *"NO_PROXY"* ]] && ok "use 带上了 NO_PROXY（否则 502）" || bad "use 漏了 NO_PROXY"
+
+out=$("$CLI" open "$PROTECTED_LANE" 2>&1)
+[[ "$out" == *"?k="* ]] && ok "open 的 URL 带 web key" || bad "open 的 URL 没带 key"
+[[ "$out" == *"view=routing"* ]] && ok "open 默认指向 routing 视图" || bad "open 没指向 routing"
+
+out=$("$CLI" routing "$PROTECTED_LANE" -n 3 2>&1)
+[[ "$out" == *"网关 :"* ]] && ok "routing 跑通" || bad "routing 失败: ${out:0:80}"
+
+out=$("$CLI" edit "$PROTECTED_LANE" --print 2>&1)
+[[ "$out" == *"providers"* ]] && ok "edit --print 打印了 providers" || bad "edit --print 没输出"
+[[ "$out" != *"生效"* || "$out" == *"不用重启"* ]] \
+  && ok "edit 说明了生效时机" || bad "edit 没说生效时机"
+
+# 带值参数不能被当成 lane 名（实测踩过：new x --client codex 把 codex 认成第二个名字）
+out=$("$CLI" routing "$PROTECTED_LANE" -n 2 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok "带值参数没被当成 lane 名" || bad "参数解析把值当了 lane 名（rc=$rc）"
+
 # ---- 5. 收尾 ----
 say "5. 收尾"
 "$CLI" down sandbox >/dev/null 2>&1
