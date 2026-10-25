@@ -122,7 +122,12 @@ func create(rw http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, err := stations.Add(b.station()); err != nil {
+	s := b.station()
+	// a new station's magpie reads no agent's sign-in on this computer:
+	// what it serves is the keys put in it, and none of the others'
+	// (#1535). It is a line in stations.yml, to take out by hand.
+	s.Env = map[string]string{"MAGPIE_NO_ACCOUNTS": "1"}
+	if _, err := stations.Add(s); err != nil {
 		fail(rw, err)
 		return
 	}
@@ -150,6 +155,13 @@ func edit(rw http.ResponseWriter, r *http.Request) {
 	}
 	s := b.station()
 	s.Protected = old.Protected // the page never takes protection off
+	// what the form doesn't carry stays as it was: a station set up by
+	// hand that lost its KeyFile would be given a new key of its own, and
+	// one that lost its Dir would move to an empty folder
+	s.KeyFile, s.KeyPath, s.Env = old.KeyFile, old.KeyPath, old.Env
+	if s.Dir == "" {
+		s.Dir = old.Dir
+	}
 	if _, err := stations.Edit(was, s); err != nil {
 		fail(rw, err)
 		return

@@ -26,6 +26,13 @@ type File struct {
 	// Root is where a station's folder goes when it names none, beside
 	// this magpie's own folder by default.
 	Root string `yaml:"root,omitempty"`
+	// Runner is the magpie that serves a station when that isn't this
+	// one: the app the reader keeps updated, while this window is a build
+	// of its own. Empty is this magpie.
+	Runner string `yaml:"runner,omitempty"`
+	// Env is put over the environment of every station's magpie, each
+	// station's own Env over it.
+	Env map[string]string `yaml:"env,omitempty"`
 	// Stations are the reader's own, in the order the page shows them.
 	Stations []Station `yaml:"stations"`
 }
@@ -45,14 +52,33 @@ const header = "# magpie's stations: the gateways on this computer, a magpie of 
 
 var fileMu sync.RWMutex
 
-// Path is stations.yml.
-func Path() string { return filepath.Join(appdir.Config(), "stations.yml") }
+// Path is stations.yml: the one StationsVar names, or the one in this
+// magpie's own folder.
+func Path() string {
+	if own := ownStations(); own != "" {
+		return own
+	}
+	return filepath.Join(appdir.Config(), "stations.yml")
+}
+
+// ownStations is the stations.yml this process was given by name, "" when
+// none was. A relative one is no name, as a relative XDG_CONFIG_HOME isn't
+// (internal/appdir): which folder it means depends on where it is run.
+func ownStations() string {
+	v := os.Getenv(StationsVar)
+	if v == "" || !filepath.IsAbs(v) {
+		return ""
+	}
+	return v
+}
 
 // DefaultRoot is where a station's folder goes when stations.yml names no
-// root: magpie-stations beside this magpie's own folder, so a station's
-// settings are never inside this one's.
+// root: magpie-stations beside the folder stations.yml is in, so a
+// station's settings are never inside this magpie's own. It is worked out
+// from Path, whichever file that is, so a line naming the window's
+// stations.yml puts a station where the window does.
 func DefaultRoot() string {
-	return filepath.Join(filepath.Dir(appdir.Config()), "magpie-stations")
+	return filepath.Join(filepath.Dir(filepath.Dir(Path())), "magpie-stations")
 }
 
 // Load reads stations.yml. A file that isn't there is no stations and no
@@ -108,6 +134,12 @@ func save(f File) error {
 // Validate says what is wrong with the file as a whole: each station on
 // its own, and no two sharing a name, a port or a folder.
 func Validate(f File) error {
+	if f.Runner != "" && !filepath.IsAbs(f.Runner) {
+		return fmt.Errorf("the runner is an absolute path, not %q", f.Runner)
+	}
+	if err := checkEnv(f.Env, "env"); err != nil {
+		return err
+	}
 	names, ports, dirs := map[string]bool{}, map[int]string{}, map[string]bool{}
 	for _, s := range f.Stations {
 		if err := s.Check(); err != nil {

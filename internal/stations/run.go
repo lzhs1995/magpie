@@ -78,8 +78,8 @@ func Report(ctx context.Context, f File, exe string) []Status {
 			Station: s,
 			State:   st, PID: pid, Exe: running,
 			Folder:  s.Folder(f.Root),
-			Launch:  s.Launch(exe, f.Root),
-			Full:    s.Full(exe, f.Root),
+			Launch:  s.Launch(exe),
+			Full:    PlanOf(f, s, exe).Line(keyRead(s, f.Root)),
 			BaseURL: s.BaseURL(), WebURL: s.WebURL(),
 			Why: why,
 		})
@@ -87,55 +87,45 @@ func Report(ctx context.Context, f File, exe string) []Status {
 	return out
 }
 
-// Start runs a station's magpie: exe, with the station's folder as its
-// XDG_CONFIG_HOME and its own page key, in a process of its own that
-// outlives this one. It is refused while something already holds the
-// station's port — including another station of this file, which Validate
-// has already kept apart.
+// Start runs a station's magpie as its Plan says, in a process of its
+// own that outlives this one, writing to serve.log in its folder. It is
+// refused while something already holds the station's port — including
+// another station of this file, which Validate has already kept apart.
 //
-// The environment it is given is this process's own, with the station's
-// XDG_CONFIG_HOME, MAGPIE_ADDR and MAGPIE_WEB_KEY over it. The port is
-// MAGPIE_ADDR and not the Port in the station's settings.json, which is
-// the station's own file to write: GatewayAddr reads the variable first
-// (internal/settings), so a station listens where the page says it does
-// without this magpie reaching into another's settings.
-func Start(ctx context.Context, f File, s Station, exe string) (int, error) {
-	if exe == "" {
+// The port is MAGPIE_ADDR and not the Port in the station's
+// settings.json, which is the station's own file to write: GatewayAddr
+// reads the variable first (internal/settings), so a station listens where
+// the page says it does without this magpie reaching into another's
+// settings.
+func Start(ctx context.Context, f File, s Station, self string) (int, error) {
+	p := PlanOf(f, s, self)
+	if p.Exe == "" {
 		return 0, errors.New("there is no magpie to start: this one's path isn't known")
 	}
-	switch st, pid, running, why := Probe(ctx, s); st {
+	switch st, pid, _, why := Probe(ctx, s); st {
 	case Up, Listening:
 		return pid, fmt.Errorf("%s is already served by pid %d", s.Name, pid)
 	case Busy:
-		_ = running
 		return 0, errors.New(why)
 	}
-	folder := s.Folder(f.Root)
-	if err := MkdirFolder(folder); err != nil {
+	if err := MkdirFolder(p.Dir); err != nil {
 		return 0, err
 	}
-	args := []string{"serve"}
-	env := append(os.Environ(), "XDG_CONFIG_HOME="+folder, "MAGPIE_ADDR="+s.Addr())
-	if s.WebPort != 0 {
-		if s.KeyFile == "" {
-			if err := ensureKey(folder); err != nil {
-				return 0, err
-			}
-		}
-		key, err := KeyOf(s, f.Root)
-		if err != nil {
-			return 0, err
-		}
-		if key == "" {
-			return 0, fmt.Errorf("%s has no page key", s.Name)
-		}
-		args = append(args, "--web=127.0.0.1:"+strconv.Itoa(s.WebPort))
-		env = append(env, "MAGPIE_WEB_KEY="+key)
+	key, err := PageKey(f, s)
+	if err != nil {
+		return 0, err
 	}
-	cmd := exec.Command(exe, args...)
-	cmd.Env = env
-	cmd.Dir = folder
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
+	// appended to, so what a station said before it last stopped is
+	// still there to read
+	out, err := os.OpenFile(p.Log, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer out.Close()
+	cmd := exec.Command(p.Exe, p.Args...)
+	cmd.Env = p.Environ(os.Environ(), key)
+	cmd.Dir = p.Dir
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, out, out
 	detach(cmd)
 	if err := cmd.Start(); err != nil {
 		return 0, err
@@ -145,6 +135,29 @@ func Start(ctx context.Context, f File, s Station, exe string) (int, error) {
 	// nothing here waits on it. Release leaves no zombie behind.
 	go func() { _ = cmd.Process.Release() }()
 	return pid, nil
+}
+
+// PageKey is the key s's page is started with, "" when it has no page. A
+// station with no KeyFile is given one in its own SecretsFile if it has
+// none; one that names a KeyFile must have its key there already, since
+// nothing here writes into a file the reader set up.
+func PageKey(f File, s Station) (string, error) {
+	if s.WebPort == 0 {
+		return "", nil
+	}
+	if s.KeyFile == "" {
+		if err := ensureKey(s.Folder(f.Root)); err != nil {
+			return "", err
+		}
+	}
+	key, err := KeyOf(s, f.Root)
+	if err != nil {
+		return "", err
+	}
+	if key == "" {
+		return "", fmt.Errorf("%s has no page key", s.Name)
+	}
+	return key, nil
 }
 
 // Stop ends the magpie serving a station, the way a reader closing it
