@@ -160,6 +160,22 @@ func PageKey(f File, s Station) (string, error) {
 	return key, nil
 }
 
+// PageURL is s's page with its key in the link, the one a browser opens
+// signed in: "" and an error when s has no page.
+func PageURL(f File, s Station) (string, error) {
+	if s.WebURL() == "" {
+		return "", fmt.Errorf("%s has no page: give it one in Edit", s.Name)
+	}
+	key, err := KeyOf(s, f.Root)
+	if err != nil {
+		return "", err
+	}
+	if key == "" {
+		return s.WebURL(), nil
+	}
+	return s.WebURL() + "/?k=" + key, nil
+}
+
 // Stop ends the magpie serving a station, the way a reader closing it
 // would: SIGTERM, so it finishes the requests it has (its own gateway
 // decides that, not this process). A protected station is refused, and so
@@ -168,6 +184,13 @@ func Stop(ctx context.Context, s Station) error {
 	if s.Protected {
 		return fmt.Errorf("%s is protected: it is stopped where it was started, not from here", s.Name)
 	}
+	return StopForce(ctx, s)
+}
+
+// StopForce is Stop for a station the reader said by name to stop even
+// though it is protected (`magpie station stop <name> --force`). A port
+// held by something that isn't a magpie is still refused.
+func StopForce(ctx context.Context, s Station) error {
 	st, pid, _, why := Probe(ctx, s)
 	switch st {
 	case Down:
