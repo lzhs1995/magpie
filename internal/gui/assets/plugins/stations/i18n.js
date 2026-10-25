@@ -33,6 +33,7 @@ magpie.strings({
     "Protected stations are started and stopped where they were started, not from here.": "受保护的网关只能在它原来的启动处停止，不能从这里停。",
     "Everything a single magpie offers is on its own page: it is a single magpie, serving its own folder.": "单个 magpie 的全部功能都在它自己的界面里：它本来就是一个独立的 magpie，读自己的配置目录。",
     "Remove {name}? Its settings folder stays where it is.": "删除 {name}？它的配置目录会原样保留。",
+    "Remove {name}? Click again": "删除 {name}？再点一次",
   },
   "zh-TW": {
     "Stations": "閘道站點",
@@ -66,6 +67,7 @@ magpie.strings({
     "Protected stations are started and stopped where they were started, not from here.": "受保護的閘道只能在原啟動處停止，不能從這裡停。",
     "Everything a single magpie offers is on its own page: it is a single magpie, serving its own folder.": "單個 magpie 的全部功能都在它自己的介面裡：它本來就是獨立的 magpie，讀自己的設定目錄。",
     "Remove {name}? Its settings folder stays where it is.": "刪除 {name}？它的設定目錄會原樣保留。",
+    "Remove {name}? Click again": "刪除 {name}？再點一次",
   },
   ja: {
     "Stations": "ゲートウェイ拠点",
@@ -99,6 +101,7 @@ magpie.strings({
     "Protected stations are started and stopped where they were started, not from here.": "保護されたゲートウェイは起動した場所で停止します。ここからは停止できません。",
     "Everything a single magpie offers is on its own page: it is a single magpie, serving its own folder.": "単体の magpie の機能はすべてその画面にあります。独立した magpie が自分のフォルダーを読んでいるからです。",
     "Remove {name}? Its settings folder stays where it is.": "{name} を削除しますか？設定フォルダーはそのまま残ります。",
+    "Remove {name}? Click again": "{name} を削除しますか？もう一度クリック",
   },
   de: {
     "Stations": "Gateways",
@@ -132,5 +135,6 @@ magpie.strings({
     "Protected stations are started and stopped where they were started, not from here.": "Geschützte Gateways werden dort beendet, wo sie gestartet wurden, nicht hier.",
     "Everything a single magpie offers is on its own page: it is a single magpie, serving its own folder.": "Alles, was ein einzelnes magpie bietet, steht auf seiner eigenen Seite: es ist ein einzelnes magpie mit eigenem Ordner.",
     "Remove {name}? Its settings folder stays where it is.": "{name} entfernen? Der Einstellungsordner bleibt, wo er ist.",
+    "Remove {name}? Click again": "{name} entfernen? Noch einmal klicken",
   },
 });
