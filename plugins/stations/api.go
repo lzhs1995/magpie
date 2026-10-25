@@ -50,7 +50,7 @@ func firstPort(c map[string]any) int {
 	if v, ok := c["firstPort"].(float64); ok && v >= 1024 {
 		return int(v)
 	}
-	return 3500
+	return stations.FirstPort
 }
 
 // conf is the page's composed config, kept at Apply so the routes read
@@ -123,10 +123,7 @@ func create(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s := b.station()
-	// a new station's magpie reads no agent's sign-in on this computer:
-	// what it serves is the keys put in it, and none of the others'
-	// (#1535). It is a line in stations.yml, to take out by hand.
-	s.Env = map[string]string{"MAGPIE_NO_ACCOUNTS": "1"}
+	s.Env = stations.NewEnv()
 	if _, err := stations.Add(s); err != nil {
 		fail(rw, err)
 		return
@@ -240,18 +237,10 @@ func open(rw http.ResponseWriter, r *http.Request) {
 		fail(rw, fmt.Errorf("no station is called %q", name))
 		return
 	}
-	if s.WebURL() == "" {
-		fail(rw, fmt.Errorf("%s has no page: give it one in Edit", name))
-		return
-	}
-	key, err := stations.KeyOf(s, f.Root)
+	url, err := stations.PageURL(f, s)
 	if err != nil {
 		fail(rw, err)
 		return
-	}
-	url := s.WebURL()
-	if key != "" {
-		url += "/?k=" + key
 	}
 	writeJSON(rw, map[string]string{"url": url})
 }
