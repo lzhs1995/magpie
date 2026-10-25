@@ -53,6 +53,11 @@ type Station struct {
 	// credentials, and the page only reads them to open it.
 	KeyFile string `yaml:"keyFile,omitempty" json:"keyFile,omitempty"`
 	KeyPath string `yaml:"keyPath,omitempty" json:"keyPath,omitempty"`
+	// Env is put over the environment the station's magpie is started
+	// from, over the file's own Env: a value of "" takes the variable out,
+	// as a proxy the station must not go through. It is shown on the page
+	// and in the line written out, so it is no place for a key.
+	Env map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
 }
 
 // nameOK is a station's name: a folder name and a URL path both take it,
@@ -104,7 +109,7 @@ func (s Station) Check() error {
 	if s.Dir != "" && !filepath.IsAbs(s.Dir) {
 		return fmt.Errorf("a station's folder is an absolute path, not %q", s.Dir)
 	}
-	return nil
+	return checkEnv(s.Env, s.Name)
 }
 
 // Folder is where the station's magpie keeps its settings: its own Dir,
@@ -151,12 +156,13 @@ const (
 
 // Launch is the one line that starts a station, for the reader to copy:
 // `magpie serve --station=<name>`. Everything else the station needs —
-// its folder, its port and its page key — magpie finds in stations.yml
-// and the station's own folder, so no path, port or key is on the
+// its folder, its port, its variables and its page key — magpie finds in
+// stations.yml and the station's own folder, so no key is on the
 // clipboard, and a station renamed or moved doesn't leave a stale line in
-// someone's notes.
-func (s Station) Launch(exe, root string) string {
-	return Quote(Command(exe)) + " serve --station=" + Quote(s.Name)
+// someone's notes. When this window's stations.yml isn't the one a plain
+// shell's magpie reads, the line names it (LaunchPrefix).
+func (s Station) Launch(exe string) string {
+	return LaunchPrefix() + Quote(Command(exe)) + " serve --station=" + Quote(s.Name)
 }
 
 // Command is how to name this magpie on a line the reader keeps: its own
@@ -193,36 +199,12 @@ func sameFile(a, b string) bool {
 	return os.SameFile(fa, fb)
 }
 
-// Full is the same start written out, for a reader who wants no
-// stations.yml in it: the variables and flags `--station` would have
-// found. The page key isn't in it — the shell reads it from the station's
-// own folder — so this line is as safe to paste as the short one.
-func (s Station) Full(exe, root string) string {
-	line := "XDG_CONFIG_HOME=" + Quote(s.Folder(root)) + " MAGPIE_ADDR=" + s.Addr()
-	if s.WebPort != 0 {
-		line += " MAGPIE_WEB_KEY=$(" + keyRead(s.Folder(root)) + ")"
-	}
-	line += " " + Quote(exe) + " serve"
-	if s.WebPort != 0 {
-		line += " --web=127.0.0.1:" + strconv.Itoa(s.WebPort)
-	}
-	return line
-}
-
 // Quote is v as one shell word.
 func Quote(v string) string {
 	if v == "" || strings.ContainsAny(v, " \t\n\"'$`\\*?[]()<>|&;#~") {
 		return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
 	}
 	return v
-}
-
-// keyRead is the shell that reads a station's page key out of its own
-// folder, so the key itself is never in the line the reader copies.
-func keyRead(folder string) string {
-	p := filepath.Join(folder, SecretsFile)
-	return "grep -o '\"webKey\"[^\"]*\"[^\"]*\"' " + Quote(p) +
-		" | sed 's/.*\"\\([^\"]*\\)\"$/\\1/'"
 }
 
 // Free says whether a port can be listened on now. A station's port that
