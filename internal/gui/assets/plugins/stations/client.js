@@ -94,10 +94,28 @@ magpie.plugin("stations", (ctx) => {
     }
     acts.append(button("Edit", "text", () => { adding = { ...s, was: s.name }; draw(); }));
     if (!s.protected) {
-      acts.append(button("Remove", "text", () => {
-        if (!confirm(t("Remove {name}? Its settings folder stays where it is.", { name: s.name }))) return;
+      // a first click asks and a second removes: the window's web view
+      // shows no confirm() of the page's (it answers false at once), so the
+      // question is the button's own, as the profile chips' × asks
+      const rm = button("Remove", "text st-rm", () => {
+        if (!rm.dataset.armed) {
+          rm.dataset.armed = "1";
+          rm.textContent = t("Remove {name}? Click again", { name: s.name });
+          rm.title = t("Remove {name}? Its settings folder stays where it is.", { name: s.name });
+          rm._t = setTimeout(disarm, 4000);
+          return;
+        }
+        disarm();
         act("remove", { name: s.name });
-      }));
+      });
+      rm.setAttribute("aria-live", "polite");
+      const disarm = () => {
+        clearTimeout(rm._t);
+        delete rm.dataset.armed;
+        rm.textContent = t("Remove");
+        rm.title = "";
+      };
+      acts.append(rm);
     }
     top.append(acts);
     c.append(top);
