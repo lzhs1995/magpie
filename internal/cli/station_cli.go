@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -48,9 +49,10 @@ func stationFlag(args []string) (rest []string, name string, err error) {
 	return rest, name, nil
 }
 
-// runStation runs the named station in this process's place. rest is what
-// was on the line besides --station: a --web of the reader's own wins over
-// the station's page port, so the long line's behaviour is still reachable.
+// runStation runs the named station in this process's place, as its
+// Plan says: the page's Start runs the same one. rest is what was on the
+// line besides --station: a --web of the reader's own wins over the
+// station's page port, so the long line's behaviour is still reachable.
 func runStation(name string, rest []string) error {
 	if err := stations.CheckName(name); err != nil {
 		return fmt.Errorf("magpie serve: %w", err)
@@ -66,44 +68,37 @@ func runStation(name string, rest []string) error {
 			known = append(known, x.Name)
 		}
 		if len(known) == 0 {
-			return fmt.Errorf("magpie serve: no station is called %q, and no station is set up yet · the window's Stations page makes one", name)
+			return fmt.Errorf("magpie serve: no station is called %q, and %s sets up none · the window's Stations page makes one, or %s names the stations.yml it keeps", name, stations.Path(), stations.StationsVar)
 		}
-		return fmt.Errorf("magpie serve: no station is called %q · there is %s", name, strings.Join(known, ", "))
+		return fmt.Errorf("magpie serve: no station is called %q in %s · there is %s", name, stations.Path(), strings.Join(known, ", "))
 	}
-	exe, err := os.Executable()
+	// one already serving it is said so, rather than a second magpie
+	// started only to fail on the port, or to fight over its folder
+	switch st, pid, _, why := stations.Probe(context.Background(), s); st {
+	case stations.Up, stations.Listening:
+		return fmt.Errorf("magpie serve: %s is already served by pid %d at %s", name, pid, s.BaseURL())
+	case stations.Busy:
+		return fmt.Errorf("magpie serve: %s: %s", name, why)
+	}
+	self, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	folder := s.Folder(f.Root)
-	if err := stations.MkdirFolder(folder); err != nil {
+	p := stations.PlanOf(f, s, self)
+	if hasWebFlag(rest) {
+		p = p.WithoutPage()
+	}
+	if err := stations.MkdirFolder(p.Dir); err != nil {
 		return err
 	}
-
-	// The station's own environment, over this process's: the folder its
-	// settings are in, and the port its gateway listens on. MAGPIE_ADDR
-	// is what GatewayAddr reads first (internal/settings), so the station
-	// listens where the page says it does without this run writing inside
-	// the station's settings.json.
-	env := envWith(os.Environ(), map[string]string{
-		"XDG_CONFIG_HOME": folder,
-		"MAGPIE_ADDR":     s.Addr(),
-	})
-
-	args := []string{exe, "serve"}
-	args = append(args, rest...)
-	// The station's page, unless the line asked for its own --web.
-	if s.WebPort != 0 && !hasWebFlag(rest) {
-		key, err := stations.Key(folder)
-		if err != nil {
-			return err
+	key := ""
+	if p.Key {
+		if key, err = stations.PageKey(f, s); err != nil {
+			return fmt.Errorf("magpie serve: %w", err)
 		}
-		if key == "" {
-			return fmt.Errorf("magpie serve: %s has no page key in %s", name, stations.SecretsFile)
-		}
-		env = envWith(env, map[string]string{"MAGPIE_WEB_KEY": key})
-		args = append(args, "--web="+strings.TrimPrefix(s.WebURL(), "http://"))
 	}
-	return stationExec(exe, args, env)
+	args := append(append([]string{p.Exe}, p.Args...), rest...)
+	return stationExec(p.Exe, args, p.Environ(os.Environ(), key))
 }
 
 // hasWebFlag says whether the line already asks for a page of its own.
@@ -114,24 +109,4 @@ func hasWebFlag(args []string) bool {
 		}
 	}
 	return false
-}
-
-// envWith is env with set over it: a variable already there is replaced
-// rather than repeated, since which of two wins is the exec'd program's
-// to decide and not something to leave to it.
-func envWith(env []string, set map[string]string) []string {
-	out := make([]string, 0, len(env)+len(set))
-	for _, kv := range env {
-		k, _, found := strings.Cut(kv, "=")
-		if found {
-			if _, over := set[k]; over {
-				continue
-			}
-		}
-		out = append(out, kv)
-	}
-	for k, v := range set {
-		out = append(out, k+"="+v)
-	}
-	return out
 }
