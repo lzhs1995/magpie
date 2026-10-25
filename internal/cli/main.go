@@ -110,6 +110,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie serve [--web[=host:port]] [--tls-cert <file> --tls-key <file>]
                                   run the gateway alone (the app runs it too); --web serves magpie web's page too, from the same process (127.0.0.1:3430 unless told);
                                   with a certificate and key (PEM; MAGPIE_TLS_CERT, MAGPIE_TLS_KEY) other computers reach both over https://
+  magpie station ls|start|stop|new|url   the gateways on this computer, a magpie of its own each, as the Stations page has them (magpie station --help)
   magpie daemon [install|uninstall|start|stop|restart|status]
                                   magpie serve as a service of yours, from boot or login and started again when it stops (systemd --user on Linux, launchd on the Mac)
   magpie daemon install [--web] [--lan] [--addr host:port] [--no-web] [--tls-cert <file> --tls-key <file>|--no-tls]
@@ -299,6 +300,11 @@ func run(args []string) error {
 	if len(args) > 0 && args[0] == "goroutines" {
 		// the running magpie's goroutines: asks it, and moves nothing here
 		return goroutinesCmd(args[1:])
+	}
+	if len(args) > 0 && (args[0] == "station" || args[0] == "stations") {
+		// stations.yml and the stations' own processes (stations_cli.go):
+		// this magpie's folder isn't theirs, and nothing in it is moved
+		return stationCmd(args)
 	}
 	if len(args) == 2 && args[0] == agent.DryRunArg {
 		// an agent disconnected on a copy of its files under a temporary
