@@ -72,10 +72,18 @@ magpie.plugin("stations", (ctx) => {
 
     const acts = el("div", "st-acts");
     if (s.state === "up" && s.webURL) {
+      // Open is a tab of this window, where the window holds tabs (macOS,
+      // stationtab.go): a station is a magpie of its own on its own port,
+      // so its page is loaded top level, in a window of its own that the
+      // system keeps in this one's tab group. Its sign-in cookie is that
+      // port's, which a frame in this page could not carry. Anywhere else,
+      // and in `magpie web`, the answer is {tabbed: false} and the link
+      // opens in the browser, as it did before.
       acts.append(button("Open", "text", async () => {
         try {
           const { url } = await api(API + "open?name=" + encodeURIComponent(s.name));
-          await api("open", { url });
+          const tab = await api("station-tab", { name: s.name, url });
+          if (!tab || !tab.tabbed) await api("open", { url });
         } catch (e) { status(e.message, "err"); }
       }));
     }
