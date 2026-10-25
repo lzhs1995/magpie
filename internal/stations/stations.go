@@ -218,6 +218,10 @@ func Free(port int) bool {
 	return true
 }
 
+// FirstPort is where a new station's ports are looked for from, unless
+// the reader says otherwise: the page's setting starts here too.
+const FirstPort = 3500
+
 // NextPort is a port no station in list has, from start upwards, and free
 // now. step apart keeps a station's gateway and page from the next
 // station's.
@@ -240,3 +244,9 @@ func NextPort(list []Station, start, step int) int {
 // MkdirFolder makes a station's folder, readable by its owner alone: the
 // keys and the settings of a gateway are in it.
 func MkdirFolder(path string) error { return os.MkdirAll(path, 0o700) }
+
+// NewEnv is the Env a station made here (the page's +, `magpie station
+// new`) starts with: its magpie reads no agent's sign-in on this
+// computer, so what it serves is the keys put in it, and none of the
+// others' (#1535). It is a line in stations.yml, to take out by hand.
+func NewEnv() map[string]string { return map[string]string{"MAGPIE_NO_ACCOUNTS": "1"} }
