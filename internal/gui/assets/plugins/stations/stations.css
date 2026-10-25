@@ -63,6 +63,11 @@
   flex-wrap: wrap;
   flex: 0 0 auto;
 }
+/* Remove asks on its first click: red while it waits for the second. */
+.st-rm[data-armed] {
+  color: var(--red);
+  background: var(--red-soft);
+}
 
 /* The state chip: its colour is the state, and the word beside it says
    the same thing, so it reads the same without colour. */
