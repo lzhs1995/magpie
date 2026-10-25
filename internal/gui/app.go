@@ -347,6 +347,9 @@ func Run(version string, showMain bool, link string) error {
 		theme = "&theme=" + t
 	}
 	h := &host{query: theme, ready: make(chan struct{})}
+	// a station's page as a tab of this window (stationtab.go); `magpie
+	// web` leaves this nil and its page opens the link itself
+	openStationTabIn = h.openStationTab
 	// the pages open at the saved text size: Windows' and Linux's webviews
 	// take it as they are made (the Zoom options below), the Mac's once
 	// the app has started (applyZoom)
