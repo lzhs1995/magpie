@@ -29,7 +29,7 @@ func init() {
 			return len(f.Stations), err
 		},
 		Parts:    []pluginrt.Part{{Slot: "nav.page", Key: "stations"}},
-		Settings: Settings{FirstPort: 3500},
+		Settings: Settings{FirstPort: stations.FirstPort},
 		Apply:    apply,
 		Client:   []string{"i18n.js", "stations.css", "client.js"},
 	})
