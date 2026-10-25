@@ -54,23 +54,9 @@ func stationFlag(args []string) (rest []string, name string, err error) {
 // line besides --station: a --web of the reader's own wins over the
 // station's page port, so the long line's behaviour is still reachable.
 func runStation(name string, rest []string) error {
-	if err := stations.CheckName(name); err != nil {
-		return fmt.Errorf("magpie serve: %w", err)
-	}
-	f, err := stations.Load()
+	f, s, err := stationNamed(name)
 	if err != nil {
-		return err
-	}
-	s, there := f.Find(name)
-	if !there {
-		known := make([]string, 0, len(f.Stations))
-		for _, x := range f.Stations {
-			known = append(known, x.Name)
-		}
-		if len(known) == 0 {
-			return fmt.Errorf("magpie serve: no station is called %q, and %s sets up none · the window's Stations page makes one, or %s names the stations.yml it keeps", name, stations.Path(), stations.StationsVar)
-		}
-		return fmt.Errorf("magpie serve: no station is called %q in %s · there is %s", name, stations.Path(), strings.Join(known, ", "))
+		return fmt.Errorf("magpie serve: %w", err)
 	}
 	// one already serving it is said so, rather than a second magpie
 	// started only to fail on the port, or to fight over its folder
@@ -99,6 +85,31 @@ func runStation(name string, rest []string) error {
 	}
 	args := append(append([]string{p.Exe}, p.Args...), rest...)
 	return stationExec(p.Exe, args, p.Environ(os.Environ(), key))
+}
+
+// stationNamed is stations.yml and the station called name in it, or why
+// there is none: the file read, and the stations it has, so a line run
+// against the wrong stations.yml says so.
+func stationNamed(name string) (stations.File, stations.Station, error) {
+	if err := stations.CheckName(name); err != nil {
+		return stations.File{}, stations.Station{}, err
+	}
+	f, err := stations.Load()
+	if err != nil {
+		return stations.File{}, stations.Station{}, err
+	}
+	s, there := f.Find(name)
+	if there {
+		return f, s, nil
+	}
+	known := make([]string, 0, len(f.Stations))
+	for _, x := range f.Stations {
+		known = append(known, x.Name)
+	}
+	if len(known) == 0 {
+		return f, s, fmt.Errorf("no station is called %q, and %s sets up none · the window's Stations page makes one, or %s names the stations.yml it keeps", name, stations.Path(), stations.StationsVar)
+	}
+	return f, s, fmt.Errorf("no station is called %q in %s · there is %s", name, stations.Path(), strings.Join(known, ", "))
 }
 
 // hasWebFlag says whether the line already asks for a page of its own.
