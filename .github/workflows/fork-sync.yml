@@ -1,0 +1,265 @@
+name: Fork sync
+
+# 只在 fork（lzhs1995/magpie）上跑：每天把 contrib-lanes rebase 到 yetone/magpie 的
+# main，测试、构建 macOS 客户端；全绿才推回 contrib-lanes 并发一个 stations-v… 发布，
+# `mg upgrade` 从这里下载。有冲突或失败就开（或更新）一个 issue，写明是哪个文件，
+# 什么都不推。
+#
+# 分成两个 job：build 跑上游的代码（测试、构建），不拿任何写权限和 secret；
+# publish 只做 git 推送和发布，不执行仓库里的任何代码。
+#
+# 推送里带着上游 .github/workflows 的改动，GITHUB_TOKEN 推不了这种提交，所以推送用
+# secret FORK_SYNC_TOKEN：fine-grained token，只给 lzhs1995/magpie 的 Contents 和
+# Workflows 读写。没有它时 publish 失败，issue 里会说明。
+
+on:
+  schedule:
+    - cron: '17 19 * * *' # 每天 03:17（UTC+8）
+  workflow_dispatch:
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BRANCH: contrib-lanes
+  UPSTREAM: https://github.com/yetone/magpie.git
+
+jobs:
+  build:
+    if: github.repository == 'lzhs1995/magpie'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    outputs:
+      status: ${{ steps.rebase.outputs.status }}
+      before: ${{ steps.rebase.outputs.before }}
+      after: ${{ steps.rebase.outputs.after }}
+      version: ${{ steps.rebase.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Rebase onto upstream
+        id: rebase
+        run: |
+          git config user.name "fork-sync"
+          git config user.email "fork-sync@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet --tags upstream main
+          set +e
+          python3 contrib/fork/sync.py rebase --onto upstream/main --report "$RUNNER_TEMP/report.json"
+          code=$?
+          set -e
+          if [ "$code" = 2 ]; then exit 1; fi
+          python3 - "$RUNNER_TEMP/report.json" >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          for k in ("status", "before", "after", "version"):
+              print("%s=%s" % (k, r.get(k, "")))
+          EOF
+
+      - name: Keep the report
+        if: always() && steps.rebase.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: ${{ runner.temp }}/report.json
+          if-no-files-found: ignore
+      # 已是最新、且这个版本已经发布过：什么都不用做
+      - name: Anything to do
+        id: need
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.rebase.outputs.status }}
+          VERSION: ${{ steps.rebase.outputs.version }}
+        run: |
+          build=false
+          if [ "$STATUS" = rebased ]; then build=true; fi
+          if [ "$STATUS" = current ] && ! gh release view "stations-$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then build=true; fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "status $STATUS, version $VERSION, build $build"
+
+      - uses: actions/setup-go@v5
+        if: steps.need.outputs.build == 'true'
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v5
+        if: steps.need.outputs.build == 'true'
+        with:
+          python-version: '3.12'
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.need.outputs.build == 'true'
+        with:
+          bun-version: 1.4.2
+
+      - name: Vet
+        if: steps.need.outputs.build == 'true'
+        run: go vet ./...
+
+      # 上游自己的全量测试在 main 上跑；这里只跑 fork 改过或加的包，
+      # 和最容易被上游改动连带的那几个
+      - name: Test
+        if: steps.need.outputs.build == 'true'
+        run: |
+          go test -count=1 -timeout 45m ./internal/stations/... ./plugins/stations/... ./internal/cli/... \
+            ./internal/gui/... ./internal/pluginrt/... ./internal/proc/... ./internal/update/...
+          python3 -m unittest contrib/lanes/tests/test_mg.py
+          python3 -m unittest contrib/fork/test_sync.py
+
+      - name: Build the client
+        if: steps.need.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.rebase.outputs.version }}
+          CGO_CFLAGS: -mmacosx-version-min=12.0
+          CGO_LDFLAGS: -mmacosx-version-min=12.0
+        run: |
+          v=$(git describe --tags --match 'v[0-9]*' --always --dirty | tr -cd 'A-Za-z0-9._+-')
+          [ "$v" = "$VERSION" ] || { echo "version $v, the rebase said $VERSION"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/dist"
+          go build -tags production -trimpath -ldflags="-s -w -X main.version=$v" -o "$RUNNER_TEMP/dist/magpie-darwin-arm64" .
+          [ "$("$RUNNER_TEMP/dist/magpie-darwin-arm64" --version)" = "magpie $v" ]
+          cd "$RUNNER_TEMP/dist" && shasum -a 256 magpie-darwin-arm64 > SHA256SUMS && cat SHA256SUMS
+
+      - name: Keep the build
+        if: steps.need.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+      # publish 拿不到 build 的工作区：rebase 出的提交装进 bundle 交给它
+      - name: Bundle the rebased branch
+        if: steps.need.outputs.build == 'true' && steps.rebase.outputs.status == 'rebased'
+        run: |
+          git bundle create "$RUNNER_TEMP/rebased.bundle" upstream/main.."$BRANCH"
+          git bundle verify "$RUNNER_TEMP/rebased.bundle"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.need.outputs.build == 'true' && steps.rebase.outputs.status == 'rebased'
+        with:
+          name: bundle
+          path: ${{ runner.temp }}/rebased.bundle
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: needs.build.result == 'success' && (needs.build.outputs.status == 'rebased' || needs.build.outputs.status == 'current')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      BEFORE: ${{ needs.build.outputs.before }}
+      AFTER: ${{ needs.build.outputs.after }}
+      VERSION: ${{ needs.build.outputs.version }}
+      STATUS: ${{ needs.build.outputs.status }}
+    steps:
+      - uses: actions/download-artifact@v4
+        id: dist
+        continue-on-error: true
+        with:
+          name: dist
+          path: dist
+
+      # 已是最新又已发布过：build 没有构建，这里也没有可发的
+      - name: Nothing to publish
+        if: steps.dist.outcome != 'success'
+        run: echo "stations-$VERSION is out already, nothing to publish"
+
+      - uses: actions/checkout@v4
+        if: steps.dist.outcome == 'success'
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        if: steps.dist.outcome == 'success' && env.STATUS == 'rebased'
+        with:
+          name: bundle
+          path: ${{ runner.temp }}
+
+      - name: Push the rebased branch
+        if: steps.dist.outcome == 'success' && env.STATUS == 'rebased'
+        env:
+          TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          [ -n "$TOKEN" ] || { echo "::error::secret FORK_SYNC_TOKEN isn't set: the rebased branch carries upstream's workflow changes, which GITHUB_TOKEN may not push"; exit 1; }
+          (cd dist && sha256sum -c SHA256SUMS)
+          git fetch --quiet "$UPSTREAM" main
+          git fetch --quiet "$RUNNER_TEMP/rebased.bundle" "refs/heads/$BRANCH:refs/rebased"
+          [ "$(git rev-parse refs/rebased)" = "$AFTER" ] || { echo "the bundle isn't $AFTER"; exit 1; }
+          # 只在远端还是 rebase 开始时那个提交时才覆盖：期间有人推过就不动
+          git push --force-with-lease="$BRANCH:$BEFORE" \
+            "https://x-access-token:$TOKEN@github.com/$GITHUB_REPOSITORY.git" "refs/rebased:refs/heads/$BRANCH"
+
+      - name: Release
+        if: steps.dist.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          gh release create "stations-$VERSION" dist/magpie-darwin-arm64 dist/SHA256SUMS \
+            -R "$GITHUB_REPOSITORY" --target "$AFTER" --title "stations $VERSION" \
+            --notes "contrib-lanes $AFTER，rebase 到 yetone/magpie main 之后构建（macOS arm64）。用 mg upgrade 安装。"
+
+  # 冲突、版本号不对、测试或构建失败、推送或发布失败：开一个 issue，已开着就在下面补一条
+  report:
+    needs: [build, publish]
+    if: always() && github.repository == 'lzhs1995/magpie' && (needs.build.result == 'failure' || needs.publish.result == 'failure' || needs.build.outputs.status == 'conflict' || needs.build.outputs.status == 'bad-version')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: report
+          path: ${{ runner.temp }}
+
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ needs.build.outputs.status }}
+          BUILD: ${{ needs.build.result }}
+          PUBLISH: ${{ needs.publish.result }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="$RUNNER_TEMP/body.md"
+          if [ "$STATUS" = conflict ] && [ -f "$RUNNER_TEMP/report.json" ]; then
+            python3 contrib/fork/sync.py issue "$RUNNER_TEMP/report.json" > "$body"
+          else
+            {
+              echo "自动跟进上游没走完。"
+              echo
+              echo "- rebase：${STATUS:-没跑完}"
+              echo "- 测试与构建（build）：$BUILD"
+              echo "- 推送与发布（publish）：$PUBLISH"
+              if [ "$STATUS" = bad-version ]; then echo "- rebase 后的版本号不是 git describe 形状，客户端会把它当正式版去下官方更新，所以没构建"; fi
+              if [ "$PUBLISH" = failure ]; then echo "- 推送要 secret FORK_SYNC_TOKEN：fine-grained token，只给 lzhs1995/magpie 的 Contents 与 Workflows 读写"; fi
+            } > "$body"
+          fi
+          printf '\n运行记录：%s\n' "$RUN" >> "$body"
+          title="fork-sync：自动跟进上游没走完"
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "fork-sync in:title" --json number,title \
+                -q ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ -n "$n" ]; then
+            gh issue comment "$n" -R "$GITHUB_REPOSITORY" -F "$body"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" -t "$title" -F "$body"
+          fi
