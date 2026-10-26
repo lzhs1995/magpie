@@ -38,3 +38,11 @@
 #
 # 装完磁盘至少还要剩多少 GB（1 GB = 1e9 字节）。默认 20。
 # min_free_gb = 20
+
+[rules]
+# mg new / mg check 的规矩（README「新网关的规矩」）。只有这两项能改，其余是规矩本身。
+# 端口格的起点：个位是 5（网关 xx45、页面 xx46），每加一个 +10。默认 3445。
+# first_port = 3445
+#
+# 除回环外也不走代理的主机，写进每个新网关的 NO_PROXY（放在回环前）。默认没有。
+# no_proxy = ["k40.shengqainbang.cn"]

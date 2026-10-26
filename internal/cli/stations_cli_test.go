@@ -239,6 +239,41 @@ func TestStationNewMakesWhatThePageMakes(t *testing.T) {
 	}
 }
 
+// new takes the station's own variables and whether it is protected, as a
+// launcher's template gives them (contrib/lanes/mg new): --env over
+// NewEnv's, K= kept in stations.yml as the variable taken out. A variable
+// said twice, one without =, or one the station sets itself is refused
+// with nothing written.
+func TestStationNewTakesEnvAndProtected(t *testing.T) {
+	stationsAt(t, stations.File{Root: t.TempDir()})
+	if _, err := station(t, "new", "tpl", "--port", "3800", "--protected",
+		"--env", "HTTPS_PROXY=", "--env=NO_PROXY=127.0.0.1,localhost,::1", "--env", "MAGPIE_NO_ACCOUNTS=1"); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := stations.Load()
+	s, _ := f.Find("tpl")
+	want := map[string]string{"HTTPS_PROXY": "", "NO_PROXY": "127.0.0.1,localhost,::1", "MAGPIE_NO_ACCOUNTS": "1"}
+	if !s.Protected || !reflect.DeepEqual(s.Env, want) {
+		t.Errorf("made %+v, want protected and env %v", s, want)
+	}
+	before, _ := os.ReadFile(stations.Path())
+	for _, args := range [][]string{
+		{"new", "x", "--env", "A=1", "--env", "A=2"},
+		{"new", "x", "--env", "NOEQUALS"},
+		{"new", "x", "--env", "=v"},
+		{"new", "x", "--env"},
+		{"new", "x", "--env", "MAGPIE_ADDR=127.0.0.1:1"},
+		{"new", "x", "--env", "1BAD=v"},
+	} {
+		if _, err := station(t, args...); err == nil {
+			t.Errorf("%v: no error", args)
+		}
+	}
+	if after, _ := os.ReadFile(stations.Path()); !bytes.Equal(before, after) {
+		t.Error("a refused new wrote stations.yml")
+	}
+}
+
 // url is the page signed in: the key read where the station keeps it.
 func TestStationURL(t *testing.T) {
 	root := t.TempDir()
