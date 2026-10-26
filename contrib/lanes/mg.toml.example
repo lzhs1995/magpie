@@ -31,3 +31,10 @@
 #
 # Codex 的目录。默认 $CODEX_HOME，再是 ~/.codex。
 # home = "~/.codex"
+
+[upgrade]
+# mg upgrade 从哪个仓库的 stations-* release 装管理台。默认 "lzhs1995/magpie"。
+# repo = "lzhs1995/magpie"
+#
+# 装完磁盘至少还要剩多少 GB（1 GB = 1e9 字节）。默认 20。
+# min_free_gb = 20

@@ -111,7 +111,7 @@ jobs:
         run: |
           go test -count=1 -timeout 45m ./internal/stations/... ./plugins/stations/... ./internal/cli/... \
             ./internal/gui/... ./internal/pluginrt/... ./internal/proc/... ./internal/update/...
-          python3 -m unittest contrib/lanes/tests/test_mg.py
+          python3 -m unittest contrib/lanes/tests/test_mg.py contrib/lanes/tests/test_mg_upgrade.py
           python3 -m unittest contrib/fork/test_sync.py
 
       - name: Build the client
