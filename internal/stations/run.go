@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -126,7 +125,7 @@ func Start(ctx context.Context, f File, s Station, self string) (int, error) {
 		return 0, err
 	}
 	defer out.Close()
-	cmd := exec.Command(p.Exe, p.Args...)
+	cmd := proc.Command(p.Exe, p.Args...)
 	cmd.Env = p.Environ(os.Environ(), key)
 	cmd.Dir = p.Dir
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, out, out
