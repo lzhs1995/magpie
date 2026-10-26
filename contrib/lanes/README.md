@@ -14,6 +14,7 @@ mg env <站>                    # 给别的工具用的 export 行
 mg web <站>                    # 浏览器里开管理台（带口令登录）
 mg new <站>                    # 新网关：端口、目录、口令都给好
 mg logs <站> -n 60
+mg upgrade                     # 管理台换成最新 release（零连接才重启；网关不碰）
 ```
 
 `cc` / `cx` / `web` 都可加 `--print`：只打印要起的命令，什么都不起。`--` 之后的
@@ -71,6 +72,30 @@ mg up work
 # 复制现有 profile，ANTHROPIC_BASE_URL 改成新网关、ANTHROPIC_AUTH_TOKEN 改成那个 key
 mg cc work -k work-s1 --print    # 先看一眼
 ```
+
+### 升级管理台：mg upgrade
+
+```sh
+mg upgrade --check     # 装着的、最新 release、管理台 pid 和连接数；什么都不动
+mg upgrade             # 下载、核 SHA、换包、零连接时重启管理台
+```
+
+fork 的 `.github/workflows/fork-sync.yml` 每天把 contrib-lanes rebase 到上游 main、
+跑测试、构建，发 `stations-<版本>` release（`magpie-darwin-arm64` + `SHA256SUMS`）。
+有冲突就在仓库开 issue，列出冲突的文件。`mg upgrade` 装最新那个：
+
+- 二进制的 SHA256 要和 `SHA256SUMS` 一致，`--version` 要正是 release 的版本，而且是
+  git describe 形状（`v0.1.N-K-g<sha>`）。正式版形状会让客户端去下官方更新，把
+  fork 换掉。比装着的旧就不装。
+- 只换 `.app` 里的 `magpie` 和 Info.plist 的两个版本号；LSEnvironment 不动，
+  `CFBundleURLTypes` 有就去掉（不抢官方 magpie.app 的 `magpie://`）。换完 ad-hoc
+  重签、`lsregister`。官方 magpie.app（`com.yetone.magpie`）一律拒绝。
+- 管理台（Info.plist 里 `MAGPIE_ADDR` 那个端口）上有任何连接就拒绝，什么都不动。
+  零连接才给它发 SIGTERM，最多等 `--wait` 秒（默认 900），不 SIGKILL。等不到时
+  新版已经装好，后台等旧的自己退出后再用 `open` 起新的。没在跑就只换不起。
+- 新管理台 60 秒内没监听，或 `GET /` 不是 200，就换回备份、起回旧的。备份在
+  `~/.local/state/magpie-stations/upgrades/`，留最近两份。
+- 网关跑的是官方 magpie.app 的二进制，一个都不碰。
 
 ### 跟 magpie-lanes 的关系
 
