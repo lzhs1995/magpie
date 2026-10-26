@@ -162,12 +162,13 @@ jobs:
       VERSION: ${{ needs.build.outputs.version }}
       STATUS: ${{ needs.build.outputs.status }}
     steps:
+      # 放 runner.temp 而不是工作区：后面的 checkout 会先清空工作区
       - uses: actions/download-artifact@v4
         id: dist
         continue-on-error: true
         with:
           name: dist
-          path: dist
+          path: ${{ runner.temp }}/dist
 
       # 已是最新又已发布过：build 没有构建，这里也没有可发的
       - name: Nothing to publish
@@ -193,7 +194,7 @@ jobs:
           TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
         run: |
           [ -n "$TOKEN" ] || { echo "::error::secret FORK_SYNC_TOKEN isn't set: the rebased branch carries upstream's workflow changes, which GITHUB_TOKEN may not push"; exit 1; }
-          (cd dist && sha256sum -c SHA256SUMS)
+          (cd "$RUNNER_TEMP/dist" && sha256sum -c SHA256SUMS)
           git fetch --quiet "$UPSTREAM" main
           git fetch --quiet "$RUNNER_TEMP/rebased.bundle" "refs/heads/$BRANCH:refs/rebased"
           [ "$(git rev-parse refs/rebased)" = "$AFTER" ] || { echo "the bundle isn't $AFTER"; exit 1; }
@@ -206,8 +207,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
         run: |
-          (cd dist && sha256sum -c SHA256SUMS)
-          gh release create "stations-$VERSION" dist/magpie-darwin-arm64 dist/SHA256SUMS \
+          cd "$RUNNER_TEMP/dist"
+          sha256sum -c SHA256SUMS
+          gh release create "stations-$VERSION" magpie-darwin-arm64 SHA256SUMS \
             -R "$GITHUB_REPOSITORY" --target "$AFTER" --title "stations $VERSION" \
             --notes "contrib-lanes $AFTER，rebase 到 yetone/magpie main 之后构建（macOS arm64）。用 mg upgrade 安装。"
 
@@ -251,7 +253,7 @@ jobs:
               echo "- 测试与构建（build）：$BUILD"
               echo "- 推送与发布（publish）：$PUBLISH"
               if [ "$STATUS" = bad-version ]; then echo "- rebase 后的版本号不是 git describe 形状，客户端会把它当正式版去下官方更新，所以没构建"; fi
-              if [ "$PUBLISH" = failure ]; then echo "- 推送要 secret FORK_SYNC_TOKEN：fine-grained token，只给 lzhs1995/magpie 的 Contents 与 Workflows 读写"; fi
+              if [ "$PUBLISH" = failure ] && [ "$STATUS" = rebased ]; then echo "- 推送 rebase 后的分支要 secret FORK_SYNC_TOKEN：fine-grained token，只给 lzhs1995/magpie 的 Contents 与 Workflows 读写"; fi
             } > "$body"
           fi
           printf '\n运行记录：%s\n' "$RUN" >> "$body"
