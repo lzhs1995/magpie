@@ -66,9 +66,11 @@ FAKE_OPEN = textwrap.dedent("""\
     if os.fork() == 0:
         os.setsid()
         if os.fork() == 0:
-            fd = os.open(os.devnull, os.O_RDWR)
-            for n in (0, 1, 2):
-                os.dup2(fd, n)
+            # 输出进 console.log：起不来时测试失败信息里能看到为什么
+            os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+            log = os.open(os.path.join(here, "console.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            os.dup2(log, 1)
+            os.dup2(log, 2)
             os.execve(exe, [exe], env)
         os._exit(0)
     os.wait()
@@ -193,7 +195,23 @@ class UpgradeTest(unittest.TestCase):
             if got and got[1] == want:
                 return got
             time.sleep(0.2)
-        self.fail("端口 %d 在 %d 秒内没回 %s（最后: %r）" % (self.port, seconds, want, served(self.port)))
+        self.fail("端口 %d 在 %d 秒内没回 %s（最后: %r）\n%s" % (self.port, seconds, want, served(self.port),
+                                                           self.diagnose()))
+
+    def diagnose(self):
+        """失败时附上：替身管理台的输出、端口上 lsof 看到的一切、记下的 pid 还活着没有。"""
+        log = self.tools / "console.log"
+        lsof = subprocess.run(["lsof", "-nP", "-iTCP:%d" % self.port], capture_output=True, text=True)
+        alive = []
+        for line in self.pids.read_text().split():
+            try:
+                os.kill(int(line), 0)
+                alive.append(line + " 活着")
+            except ProcessLookupError:
+                alive.append(line + " 已退")
+        return "console.log:\n%s\nlsof rc=%d:\n%s%s\npids: %s" % (
+            log.read_text()[-3000:] if log.exists() else "（没有）", lsof.returncode,
+            lsof.stdout[-1500:], lsof.stderr[-500:], ", ".join(alive) or "（没有）")
 
     def start_console(self):
         subprocess.run([str(self.tools / "open"), str(self.app)], check=True)
@@ -264,6 +282,15 @@ class UpgradeTest(unittest.TestCase):
         self.assert_untouched(r, "SHA256 对不上")
         self.assertEqual(self.console_pid(), old_pid)
         self.assertEqual(served(self.port), (200, OLD))
+
+    def test_a_short_download_is_retried_then_refused(self):
+        # release 列的大小比实际多 1 字节：每次下到的都「不完整」
+        rels = json.loads((self.root / "releases.json").read_text())
+        rels[0]["assets"][0]["size"] += 1
+        (self.root / "releases.json").write_text(json.dumps(rels))
+        r = self.mg()
+        self.assert_untouched(r, "下载不完整")
+        self.assertEqual(r.stdout.count("下载不完整"), 3, r.stdout)
 
     def test_a_release_whose_version_is_not_describe_shaped_is_refused(self):
         self.release("v0.1.1565")
@@ -364,18 +391,21 @@ class UpgradeTest(unittest.TestCase):
 
     def test_a_port_held_by_another_program_is_left_alone(self):
         # 别的程序是单独的进程，退出就被收走：mg 万一 kill 了它，测试本身不会跟着挨 SIGTERM
+        other_log = (self.root / "other.log").open("w")
         other = subprocess.Popen([sys.executable, "-m", "http.server", "--bind", "127.0.0.1", str(self.port)],
-                                 cwd=self.home, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 cwd=self.home, stdout=other_log, stderr=subprocess.STDOUT)
         threading.Thread(target=other.wait, daemon=True).start()
         try:
             deadline = time.monotonic() + 20
             while self.console_pid() != other.pid and time.monotonic() < deadline:
                 time.sleep(0.1)
-            self.assertEqual(self.console_pid(), other.pid)
+            self.assertEqual(self.console_pid(), other.pid, "served=%r other.log=%r\n%s" % (
+                served(self.port), (self.root / "other.log").read_text()[-1500:], self.diagnose()))
             self.assert_untouched(self.mg(), "被别的程序占着")
             self.assertIsNone(other.poll(), "mg 动了占着端口的别的程序")
         finally:
             other.kill()
+            other_log.close()
 
     def test_the_official_bundle_is_never_upgraded(self):
         self.write_info(CFBundleIdentifier="com.yetone.magpie")
