@@ -40,6 +40,9 @@ type Status struct {
 	// BaseURL is what a client is pointed at; WebURL is its page.
 	BaseURL string `json:"baseURL"`
 	WebURL  string `json:"webURL,omitempty"`
+	// Clients is the lines that open Claude Code and Codex through it
+	// (ClientLines).
+	Clients []ClientLine `json:"clients"`
 	// Why says what is wrong when the state isn't Up or Down.
 	Why string `json:"why,omitempty"`
 }
@@ -81,7 +84,8 @@ func Report(ctx context.Context, f File, exe string) []Status {
 			Launch:  s.Launch(exe),
 			Full:    PlanOf(f, s, exe).Line(keyRead(s, f.Root)),
 			BaseURL: s.BaseURL(), WebURL: s.WebURL(),
-			Why: why,
+			Clients: ClientLines(s, ProfilesDir(f.Root)),
+			Why:     why,
 		})
 	}
 	return out
