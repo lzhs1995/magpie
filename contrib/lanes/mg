@@ -662,14 +662,25 @@ def download_verified(rel, stage):
     if len(want) != 1 or not re.fullmatch(r"[0-9a-f]{64}", want[0]):
         raise Refused("%s 里没有唯一一行 %s 的 SHA256" % (RELEASE_SUMS, RELEASE_ASSET))
     new = stage / RELEASE_ASSET
-    try:
-        fetch(rel["asset"], new)
-    except OSError as exc:
-        raise Refused("下载 %s 失败: %s" % (RELEASE_ASSET, exc))
+    # 连接中途断开时 http.client 不报错，只是少给字节：按 release 列的大小核，不够就重下
+    for attempt in range(1, 4):
+        try:
+            fetch(rel["asset"], new)
+        except OSError as exc:
+            err = "下载 %s 失败: %s" % (RELEASE_ASSET, exc)
+        else:
+            size = new.stat().st_size
+            if not rel["size"] or size == rel["size"]:
+                break
+            err = "下载不完整：收到 %d 字节，release 写的是 %d" % (size, rel["size"])
+        print("  %s（第 %d 次）" % (err, attempt))
+    else:
+        raise Refused(err)
     with new.open("rb") as fh:
         got = hashlib.file_digest(fh, "sha256").hexdigest()
     if got != want[0]:
-        raise Refused("SHA256 对不上：下到的是 %s，%s 写的是 %s" % (got, RELEASE_SUMS, want[0]))
+        raise Refused("SHA256 对不上（%d 字节）：下到的是 %s，%s 写的是 %s"
+                      % (new.stat().st_size, got, RELEASE_SUMS, want[0]))
     new.chmod(0o755)
     ver = binary_version(new)
     if ver != rel["version"]:
