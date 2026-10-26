@@ -28,7 +28,7 @@ MG = Path(__file__).resolve().parent.parent / "mg"
 # SIGTERM 后过 exit_delay 秒才退。pid 记进 pids.txt，tearDown 清理。
 FAKE_CONSOLE = textwrap.dedent("""\
     #!%(py)s
-    import http.server, os, signal, sys, threading
+    import http.server, os, signal, socketserver, sys, threading
     VERSION, STATUS, EXIT_DELAY, PIDS = %(version)r, %(status)d, %(exit_delay)r, %(pids)r
     if sys.argv[1:] == ["--version"]:
         print("magpie " + VERSION)
@@ -43,7 +43,13 @@ FAKE_CONSOLE = textwrap.dedent("""\
             self.wfile.write(body)
         def log_message(self, *a):
             pass
-    srv = http.server.ThreadingHTTPServer((host, int(port)), H)
+    class Srv(http.server.ThreadingHTTPServer):
+        # 跳过 HTTPServer.server_bind 里的 socket.getfqdn：GitHub 的 macOS runner 上它反查
+        # DNS 卡住，套接字绑上了却迟迟不 listen（lsof 显示 CLOSED）
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
+    srv = Srv((host, int(port)), H)
     srv.daemon_threads = True
     signal.signal(signal.SIGTERM, lambda *_a: threading.Timer(EXIT_DELAY, lambda: os._exit(0)).start())
     with open(PIDS, "a") as fh:
@@ -89,6 +95,27 @@ FAKE_TOOL = textwrap.dedent("""\
         os.remove(flag)
         sys.stderr.write(name + " 替身按要求失败\\n")
         sys.exit(1)
+    """)
+
+# gh 替身：记下参数，回 releases.json。
+FAKE_GH = textwrap.dedent("""\
+    #!%(py)s
+    import json, os, sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "args.json"), "w") as fh:
+        json.dump(sys.argv[1:], fh)
+    sys.stdout.write(open(%(releases)r).read())
+    """)
+
+# 「别的程序」：只 listen 不应答（不用 http.server，理由同 FAKE_CONSOLE 的 Srv）。
+LISTENER = textwrap.dedent("""\
+    import socket, sys, time
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+    s.listen(5)
+    print("listening", flush=True)
+    time.sleep(600)
     """)
 
 OLD = "v0.1.1564-16-ga15f7a67"
@@ -179,12 +206,15 @@ class UpgradeTest(unittest.TestCase):
             "assets": [{"name": n, "size": (rel / n).stat().st_size, "browser_download_url": (rel / n).as_uri()}
                        for n in ("magpie-darwin-arm64", "SHA256SUMS")]}]))
 
-    def mg(self, *args, binary=None, tools=None):
+    def mg(self, *args, binary=None, tools=None, path_prefix=None):
         e = {k: v for k, v in os.environ.items() if k not in PROXY_ENV and k != "_MG_REEXEC"}
         e.update({"HOME": str(self.home), "MG_CONFIG": str(self.root / "mg.toml"),
                   "MG_MAGPIE": str(binary or self.binary), "MAGPIE_STATIONS": str(self.root / "stations.yml"),
                   "MG_TOOLS_DIR": str(tools or self.tools), "XDG_STATE_HOME": str(self.state),
                   "MG_RELEASES_API": (self.root / "releases.json").as_uri()})
+        if path_prefix:  # 走 PATH 上的 gh 替身，不用 file:// 列表
+            e.pop("MG_RELEASES_API")
+            e["PATH"] = "%s%s%s" % (path_prefix, os.pathsep, e.get("PATH", ""))
         return subprocess.run([sys.executable, str(MG), "upgrade", *args], env=e,
                               capture_output=True, text=True, timeout=120)
 
@@ -292,6 +322,18 @@ class UpgradeTest(unittest.TestCase):
         self.assert_untouched(r, "下载不完整")
         self.assertEqual(r.stdout.count("下载不完整"), 3, r.stdout)
 
+    def test_the_release_list_comes_from_gh_when_present(self):
+        ghbin = self.root / "ghbin"
+        ghbin.mkdir()
+        (ghbin / "gh").write_text(FAKE_GH % {"py": sys.executable, "releases": str(self.root / "releases.json")})
+        (ghbin / "gh").chmod(0o755)
+        r = self.mg("--check", path_prefix=ghbin)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((ghbin / "args.json").exists(), "mg 没调 gh")
+        self.assertEqual(json.loads((ghbin / "args.json").read_text()),
+                         ["api", "repos/lzhs1995/magpie/releases?per_page=30"])
+        self.assertIn(NEW, r.stdout)
+
     def test_a_release_whose_version_is_not_describe_shaped_is_refused(self):
         self.release("v0.1.1565")
         self.assert_untouched(self.mg(), "git describe")
@@ -392,7 +434,7 @@ class UpgradeTest(unittest.TestCase):
     def test_a_port_held_by_another_program_is_left_alone(self):
         # 别的程序是单独的进程，退出就被收走：mg 万一 kill 了它，测试本身不会跟着挨 SIGTERM
         other_log = (self.root / "other.log").open("w")
-        other = subprocess.Popen([sys.executable, "-m", "http.server", "--bind", "127.0.0.1", str(self.port)],
+        other = subprocess.Popen([sys.executable, "-c", LISTENER, str(self.port)],
                                  cwd=self.home, stdout=other_log, stderr=subprocess.STDOUT)
         threading.Thread(target=other.wait, daemon=True).start()
         try:
