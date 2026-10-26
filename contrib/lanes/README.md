@@ -82,7 +82,8 @@ mg upgrade             # 下载、核 SHA、换包、零连接时重启管理台
 
 fork 的 `.github/workflows/fork-sync.yml` 每天把 contrib-lanes rebase 到上游 main、
 跑测试、构建，发 `stations-<版本>` release（`magpie-darwin-arm64` + `SHA256SUMS`）。
-有冲突就在仓库开 issue，列出冲突的文件。`mg upgrade` 装最新那个：
+有冲突就在仓库开 issue，列出冲突的文件。`mg upgrade` 装最新那个。release 列表有登录过的
+`gh` 就用 `gh api` 读（不登录的 API 按出口 IP 限 60 次/小时，代理出口共用时会 403）：
 
 - 二进制的 SHA256 要和 `SHA256SUMS` 一致，`--version` 要正是 release 的版本，而且是
   git describe 形状（`v0.1.N-K-g<sha>`）。正式版形状会让客户端去下官方更新，把
