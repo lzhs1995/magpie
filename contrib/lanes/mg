@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""mg —— 用哪个网关、开或续哪个客户端，每件事只有一种写法。
+
+    mg ls                         全部网关：状态、pid、钉着的客户端数、网关/管理台地址
+    mg up <站>|--all              起它（已在服务就不动）
+    mg down <站> [--force]        停它；受保护的要 --force
+    mg cc <站> [-k <key>] [-r <id>] [--print] [-- 其它参数]
+                                  Claude Code 经这个网关：新会话 / 续会话
+    mg cx <站> [-r <id>] [--print] [-- 其它参数]
+                                  Codex 经这个网关：新会话 / 续会话
+    mg env <站> [--json]          给别的工具用的 export 行
+    mg web <站> [--print]         浏览器里开它的管理台（带口令登录）
+    mg new <站> [--port N] [--note …]   建一个新网关（端口、目录、口令都给好）
+    mg logs <站> [-n N]           看它的 serve.log（抹掉口令）
+
+铁律（每条都由本工具强制，不靠记性）：
+- 只起新的客户端进程。不改 ~/.claude/settings.json、~/.codex/config.toml，
+  不碰任何网关的 providers.json —— 不换上游 URL，不换上游 key。
+- 客户端只换「打给哪个网关」：Claude Code 用 --settings 的 profile，
+  Codex 用 -c model_providers.<provider>.base_url；两边都带 NO_PROXY（含 127.0.0.1）。
+- 续会话前先查那个会话有没有被别的进程占着，占着就拒绝。
+- Claude 的 profile 必须指向这个网关、带的是这个网关自己的调用 key。
+
+网关清单只有一份：stations.yml，由 fork 的 `magpie station ls --json` 读
+（和客户端「网关站点」页同一份代码）。本工具不自己解析 stations.yml，也不
+自己拼网关的启动环境 —— 那份逻辑只在 Go 里有一份（internal/stations/plan.go）。
+
+本机设置在 mg.toml（不进仓库，照 mg.toml.example 写）：
+  $MG_CONFIG → ~/.config/magpie-stations/mg.toml → 与本文件同目录的 mg.toml
+"""
+
+import hmac
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+# tomllib 要 3.11+。系统 python3 是 3.9，找一个带 tomllib 的重新 exec（同 magpie-lanes）。
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - bootstrap path
+    if os.environ.get("_MG_REEXEC"):
+        sys.exit("mg: 重新 exec 后依然没有 tomllib，放弃")
+    from shutil import which
+    for cand in ("python3.14", "python3.13", "python3.12", "python3.11", "/opt/homebrew/bin/python3"):
+        exe = cand if os.path.sep in cand else which(cand)
+        if exe and subprocess.run([exe, "-c", "import tomllib"], capture_output=True).returncode == 0:
+            os.environ["_MG_REEXEC"] = "1"
+            os.execv(exe, [exe, os.path.abspath(__file__)] + sys.argv[1:])
+    sys.exit("mg: 需要 Python 3.11+（tomllib）。")
+
+HERE = Path(__file__).resolve().parent
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+SESSION_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# 日志里凡像口令/key 的都抹掉（magpie 启动横幅把 MAGPIE_WEB_KEY 印在 ?k= 里）。
+REDACTIONS = (
+    (re.compile(r"\?k=[A-Za-z0-9_\-]+"), "?k=<WEBKEY>"),
+    (re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_\-]{16,}"), "sk-<REDACTED>"),
+)
+
+
+class Refused(Exception):
+    """拒绝执行：说明为什么，什么都没起。"""
+
+
+def redact(text):
+    for pat, repl in REDACTIONS:
+        text = pat.sub(repl, text)
+    return text
+
+
+# -------------------------------------------------------------------- 配置
+def load_config():
+    """mg.toml，没有就全用默认值。只认这几节，别的键报错，免得写错了没生效。"""
+    known = {"magpie": {"binary", "stations"},
+             "claude": {"launcher", "profiles"},
+             "codex": {"launcher", "provider", "home"}}
+    for cand in (os.environ.get("MG_CONFIG"),
+                 str(Path.home() / ".config" / "magpie-stations" / "mg.toml"),
+                 str(HERE / "mg.toml")):
+        if cand and Path(cand).expanduser().is_file():
+            path = Path(cand).expanduser()
+            with path.open("rb") as fh:
+                raw = tomllib.load(fh)
+            for sect, val in raw.items():
+                if sect not in known or not isinstance(val, dict):
+                    raise Refused("%s: 不认识 [%s]（只有 %s）" % (path, sect, ", ".join(sorted(known))))
+                bad = sorted(set(val) - known[sect])
+                if bad:
+                    raise Refused("%s: [%s] 不认识 %s" % (path, sect, ", ".join(bad)))
+            raw["_path"] = str(path)
+            return raw
+    return {"_path": None}
+
+
+def as_argv(value, what):
+    """launcher 可写成一个路径或一个 argv 列表。"""
+    if isinstance(value, str):
+        return [os.path.expanduser(value)]
+    if isinstance(value, list) and value and all(isinstance(x, str) for x in value):
+        return [os.path.expanduser(x) for x in value]
+    raise Refused("mg.toml 里 %s 要是路径或字符串列表" % what)
+
+
+# fork 客户端（magpie-stations.app）里的 magpie：它带 `magpie station`。
+APP_CANDIDATES = (
+    "~/Applications/magpie-stations.app",
+    "/Applications/magpie-stations.app",
+)
+
+
+def magpie_binary(cfg):
+    want = os.environ.get("MG_MAGPIE") or cfg.get("magpie", {}).get("binary")
+    if want:
+        p = Path(want).expanduser()
+        if not os.access(p, os.X_OK):
+            raise Refused("magpie 不可执行: %s" % p)
+        return str(p)
+    for app in APP_CANDIDATES:
+        p = Path(app).expanduser() / "Contents" / "MacOS" / "magpie"
+        if os.access(p, os.X_OK):
+            return str(p)
+    raise Refused("找不到带 `magpie station` 的 magpie（fork 客户端）。设 MG_MAGPIE 或 mg.toml 的 [magpie] binary。")
+
+
+def stations_file(cfg, binary):
+    """stations.yml 在哪。没写明就跟客户端双击时读的是同一份：
+    app 的 Info.plist 里 LSEnvironment 的 XDG_CONFIG_HOME/magpie/stations.yml。"""
+    want = os.environ.get("MAGPIE_STATIONS") or cfg.get("magpie", {}).get("stations")
+    if want:
+        return str(Path(want).expanduser())
+    plist = Path(binary).parent.parent / "Info.plist"
+    if plist.is_file():
+        import plistlib
+        try:
+            with plist.open("rb") as fh:
+                env = plistlib.load(fh).get("LSEnvironment") or {}
+        except Exception:  # noqa: BLE001 - 读不了就当没写
+            env = {}
+        xdg = env.get("XDG_CONFIG_HOME")
+        if xdg and os.path.isabs(xdg):
+            return os.path.join(xdg, "magpie", "stations.yml")
+    return None  # 交给 magpie 自己的默认位置
+
+
+class Stations:
+    """`magpie station …` 的一层薄壳：读清单、起停、建站都走 Go 那一份代码。"""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.binary = magpie_binary(cfg)
+        self.file = stations_file(cfg, self.binary)
+
+    def env(self):
+        env = dict(os.environ)
+        if self.file:
+            env["MAGPIE_STATIONS"] = self.file
+        else:
+            env.pop("MAGPIE_STATIONS", None)  # 交给 magpie 自己的默认位置
+        return env
+
+    def run(self, *args, capture=False):
+        return subprocess.run([self.binary, "station", *args], env=self.env(),
+                              capture_output=capture, text=True)
+
+    def listing(self):
+        proc = self.run("ls", "--json", capture=True)
+        if proc.returncode != 0:
+            raise Refused("magpie station ls 失败: %s" % (proc.stderr.strip() or proc.stdout.strip()))
+        return json.loads(proc.stdout)
+
+    def find(self, name):
+        data = self.listing()
+        for s in data["stations"]:
+            if s["name"] == name:
+                return data, s
+        raise Refused("%s 里没有网关 %r（有: %s）" % (data["path"], name,
+                      ", ".join(s["name"] for s in data["stations"]) or "无"))
+
+
+# -------------------------------------------------------------------- 实测
+def merge_no_proxy(current):
+    """NO_PROXY：本机回环放最前，原来有的一个不丢。.zshrc 把 HTTP(S)_PROXY 指向
+    127.0.0.1:7897，codex 的 reqwest 会把 127.0.0.1 也交给它 —— 少了这步就是 502。"""
+    seen, out = set(), []
+    for item in list(LOOPBACK) + [x.strip() for x in (current or "").split(",")]:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return ",".join(out)
+
+
+def other_processes():
+    """(pid, args)：除了自己和自己的祖先。args 只在本进程内比对，绝不打印 ——
+    codex 的 argv 里可能有 bearer token。"""
+    mine, pid = {os.getpid()}, os.getppid()
+    for _ in range(8):
+        if pid <= 1:
+            break
+        mine.add(pid)
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        pid = int(out) if out.isdigit() else 0
+    proc = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True)
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) not in mine:
+            if not parts[1].startswith("ps "):
+                yield int(parts[0]), parts[1]
+
+
+def pinned_counts(stations, skip):
+    """每个网关端口上钉着几个客户端（启动时把 127.0.0.1:<端口> 写进参数的进程）。
+    magpie 自己（skip 里的二进制）不算：它的 --web= 参数也带端口。"""
+    ports = {s["port"]: 0 for s in stations}
+    pat = re.compile(r"127\.0\.0\.1:(\d+)(?!\d)")
+    for _pid, args in other_processes():
+        if any(b and args.startswith(b) for b in skip):
+            continue
+        for p in {int(x) for x in pat.findall(args)}:
+            if p in ports:
+                ports[p] += 1
+    return ports
+
+
+def resumed_elsewhere(session_id):
+    """哪些进程已经在续这个会话（参数里 --resume/-r/resume 后面跟着它）。"""
+    pat = re.compile(r"(?:^|\s)(?:--resume|-r|resume)(?:=|\s+)" + re.escape(session_id) + r"(?:\s|$)")
+    return sorted(pid for pid, args in other_processes() if pat.search(args) and "contrib/lanes/mg" not in args)
+
+
+def holders(path):
+    proc = subprocess.run(["lsof", "-t", "--", str(path)], capture_output=True, text=True)
+    return sorted({int(x) for x in proc.stdout.split() if x.isdigit()} - {os.getpid()})
+
+
+# -------------------------------------------------------------------- 网关
+def cmd_ls(st, args):
+    data = st.listing()
+    rows = data["stations"]
+    if not rows:
+        print("%s 里还没有网关 —— mg new <名> 建一个" % data["path"])
+        return 0
+    pins = pinned_counts(rows, (data.get("runner"), st.binary))
+    head = ("网关", "状态", "pid", "客户端", "网关地址", "管理台", "")
+    table = [head]
+    for s in rows:
+        state = s["state"] + ("（%s）" % s["why"] if s.get("why") else "")
+        table.append((s["name"], state, str(s.get("pid") or "-"), str(pins.get(s["port"], 0)),
+                      s["baseURL"], s.get("webURL") or "-", "受保护" if s.get("protected") else ""))
+    widths = [max(len(r[i]) for r in table) for i in range(len(head))]
+    for r in table:
+        print("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
+    print("\n清单: %s" % data["path"])
+    return 0
+
+
+def cmd_up(st, args):
+    names = [s["name"] for s in st.listing()["stations"]] if args.all else [args.station]
+    if not names or names == [None]:
+        raise Refused("要指定网关名，或 --all")
+    bad = 0
+    for name in names:
+        bad += st.run("start", name).returncode != 0
+    return 1 if bad else 0
+
+
+def cmd_down(st, args):
+    # 没有 --all：一次停一个，名字写明，受保护的再加 --force
+    flags = ["--force"] if args.force else []
+    return st.run("stop", args.station, *flags).returncode
+
+
+# -------------------------------------------------------------------- Claude Code
+# Claude Code 只认 settings 里的 env：shell 里 export ANTHROPIC_BASE_URL 会被
+# ~/.claude/settings.json 的 env 块盖掉（本机 2026-08-25 实测）。--settings 的 env
+# 与 settings.json 的是逐键深合并：profile 没写的键会从 settings.json 渗进来，
+# 所以下面这几个键 profile 必须自己写（空串=中和，缺键=渗漏）。
+ROUTING_KEYS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+# 缺了只提醒：渗进来的是 settings.json 的压缩窗口这类设置，不改请求打给谁。
+SOFT_KEYS = ("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+             "ANTHROPIC_BETAS", "CACHE_FIX_PROXY_UPSTREAM")
+
+
+def profiles_dir(cfg, data):
+    want = cfg.get("claude", {}).get("profiles")
+    if want:
+        return Path(want).expanduser()
+    return Path(data["root"]) / "profiles"
+
+
+def profile_env(path):
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    env = doc.get("env") if isinstance(doc, dict) else None
+    if not isinstance(env, dict):
+        raise Refused("%s 没有 env 块" % path)
+    return env
+
+
+def caller_keys(station):
+    """这个网关自己的调用 key（gateway key）。只回 (名, secret)，secret 不出本进程。"""
+    p = Path(station["folder"]) / "magpie" / "caller-keys.json"
+    if not p.is_file():
+        return None
+    with p.open(encoding="utf-8") as fh:
+        rows = json.load(fh)
+    return [(r.get("name", ""), r.get("secret", "")) for r in rows if isinstance(r, dict)]
+
+
+def check_profile(path, station, warn):
+    """profile 必须：打给这个网关、带这个网关自己的 key、代理键都自己写明。"""
+    env = profile_env(path)
+    missing = [k for k in ROUTING_KEYS if k not in env]
+    if missing:
+        raise Refused("%s 缺 %s：缺了会从 ~/.claude/settings.json 渗进别家的值" % (path, ", ".join(missing)))
+    base = env["ANTHROPIC_BASE_URL"].rstrip("/")
+    if base != station["baseURL"]:
+        raise Refused("%s 打给 %s，不是 %s 的网关 %s" % (path, base or "（空）", station["name"], station["baseURL"]))
+    if any(env.get(k) for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")):
+        if "127.0.0.1" not in env.get("NO_PROXY", "").split(","):
+            raise Refused("%s 设了代理，但 NO_PROXY 里没有 127.0.0.1：请求会被代理拦走" % path)
+    token = env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY") or ""
+    keys = caller_keys(station)
+    if keys:
+        hit = [n for n, s in keys if s and hmac.compare_digest(s, token)]
+        if not hit:
+            raise Refused("%s 带的 key 不是 %s 的调用 key（有: %s）" % (path, station["name"], ", ".join(n for n, _ in keys)))
+        key_name = hit[0]
+    else:
+        key_name = None
+        warn("%s 没有 caller-keys.json，核不了 profile 的 key 是不是它的（只在本机回环上用）" % station["name"])
+    # 只提 settings.json 里真有的：没有的键渗不进来
+    base_env = settings_env_keys()
+    soft = [k for k in SOFT_KEYS if k not in env and (base_env is None or k in base_env)]
+    if soft:
+        warn("%s 没写 %s：这几项会用 ~/.claude/settings.json 的值" % (path.name, ", ".join(soft)))
+    return env, key_name
+
+
+def settings_env_keys():
+    """~/.claude/settings.json 的 env 有哪些键（只要键名）；读不了是 None。"""
+    p = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "settings.json"
+    try:
+        with p.open(encoding="utf-8") as fh:
+            env = json.load(fh).get("env")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return set(env) if isinstance(env, dict) else set()
+
+
+def pick_profile(cfg, data, station, key):
+    folder = profiles_dir(cfg, data)
+    if key:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", key):
+            raise Refused("-k 只收 profile 名（字母数字 . _ -），不收路径: %r" % key)
+        path = folder / (key + ".json")
+        if not path.is_file():
+            raise Refused("没有 profile %s" % path)
+        return path
+    found = []
+    for p in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        if p.name.startswith((".", "_")):
+            continue
+        try:
+            if profile_env(p).get("ANTHROPIC_BASE_URL", "").rstrip("/") == station["baseURL"]:
+                found.append(p)
+        except (Refused, ValueError, OSError):
+            continue
+    if not found:
+        raise Refused("%s 下没有打给 %s（%s）的 profile。照现有的复制一份，env 里 ANTHROPIC_BASE_URL 写 %s、"
+                      "ANTHROPIC_AUTH_TOKEN 写这个网关的调用 key" % (folder, station["name"], station["baseURL"], station["baseURL"]))
+    if len(found) > 1:
+        raise Refused("%s 有 %d 个 profile，用 -k 指定一个: %s" % (station["name"], len(found), ", ".join(p.stem for p in found)))
+    return found[0]
+
+
+def claude_transcripts(session_id):
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    return sorted(root.glob("*/%s.jsonl" % session_id)) if root.is_dir() else []
+
+
+def show(argv, env_set):
+    for k, v in env_set.items():
+        print("  %s=%s" % (k, shlex.quote(v)))
+    print("  " + " ".join(shlex.quote(a) for a in argv))
+
+
+def cmd_cc(st, args, extra, warn):
+    data, station = st.find(args.station)
+    if station["state"] != "up":
+        raise Refused("%s 的网关 %s 不在服务（%s）—— 先 mg up %s" % (station["name"], station["baseURL"], station["state"], station["name"]))
+    profile = pick_profile(st.cfg, data, station, args.key)
+    _env, key_name = check_profile(profile, station, warn)
+    argv = as_argv(st.cfg.get("claude", {}).get("launcher") or os.environ.get("MG_CLAUDE") or "claude", "[claude] launcher")
+    argv += ["--settings", str(profile)]
+    if args.resume:
+        if not SESSION_ID.match(args.resume):
+            raise Refused("会话 id 不像 Claude Code 的（8-4-4-4-12 位十六进制）: %r" % args.resume)
+        busy = resumed_elsewhere(args.resume)
+        if busy:
+            raise Refused("会话 %s 正被这些进程续着: %s —— 先在那个窗口退出，再续" % (args.resume, " ".join(map(str, busy))))
+        if not claude_transcripts(args.resume):
+            warn("没找到会话 %s 的记录（~/.claude/projects/*/%s.jsonl）；Claude Code 自己会再报一次" % (args.resume, args.resume))
+        argv += ["--resume", args.resume]
+    argv += extra
+    env_set = {"NO_PROXY": merge_no_proxy(os.environ.get("NO_PROXY")),
+               "no_proxy": merge_no_proxy(os.environ.get("no_proxy"))}
+    print("Claude Code → %s（%s）· profile %s%s" % (station["name"], station["baseURL"], profile.name,
+          " · 调用 key %s" % key_name if key_name else ""), file=sys.stderr)
+    if args.print:
+        show(argv, env_set)
+        return 0
+    os.execvpe(argv[0], argv, {**os.environ, **env_set})
+
+
+# -------------------------------------------------------------------- Codex
+def codex_home(cfg):
+    want = cfg.get("codex", {}).get("home") or os.environ.get("CODEX_HOME")
+    return Path(want).expanduser() if want else Path.home() / ".codex"
+
+
+def codex_launcher(cfg):
+    want = cfg.get("codex", {}).get("launcher") or os.environ.get("CODEX_BIN")
+    if want:
+        return as_argv(want, "[codex] launcher")
+    return ["/opt/homebrew/bin/codex"] if os.access("/opt/homebrew/bin/codex", os.X_OK) else ["codex"]
+
+
+def cmd_cx(st, args, extra, warn):
+    _data, station = st.find(args.station)
+    if station["state"] != "up":
+        raise Refused("%s 的网关 %s 不在服务（%s）—— 先 mg up %s" % (station["name"], station["baseURL"], station["state"], station["name"]))
+    home = codex_home(st.cfg)
+    provider = st.cfg.get("codex", {}).get("provider", "custom")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", provider):
+        raise Refused("mg.toml 的 [codex] provider 只收字母数字 _ -: %r" % provider)
+    conf = home / "config.toml"
+    try:
+        with conf.open("rb") as fh:
+            cx = tomllib.load(fh)
+    except FileNotFoundError:
+        raise Refused("没有 %s" % conf)
+    # -c 只改 model_providers.<provider>.base_url。Codex 用的若不是这个 provider，
+    # 覆盖不生效，请求会绕过网关直连 —— 宁可不起。
+    if cx.get("model_provider") != provider:
+        raise Refused("%s 的 model_provider 是 %r，不是 %r：-c 覆盖 base_url 不会生效，请求会绕过网关"
+                      % (conf, cx.get("model_provider"), provider))
+    if provider not in (cx.get("model_providers") or {}):
+        raise Refused("%s 没有 [model_providers.%s]" % (conf, provider))
+    argv = codex_launcher(st.cfg)
+    if os.environ.get("CX_DISABLE_COMPUTER_USE") == "1":
+        argv += ["--disable", "computer_use"]
+    argv += ["-c", 'model_providers.%s.base_url="%s/v1"' % (provider, station["baseURL"])]
+    argv += extra
+    if args.resume:
+        if not re.fullmatch(r"[0-9A-Za-z-]{8,64}", args.resume):
+            raise Refused("会话 id 只收字母数字和 -: %r" % args.resume)
+        rollouts = sorted((home / "sessions").glob("*/*/*/rollout-*-%s.jsonl" % args.resume))
+        if not rollouts:
+            warn("没找到会话 %s 的 rollout（%s/sessions）；Codex 自己会再报一次" % (args.resume, home))
+        for r in rollouts:
+            busy = holders(r)
+            if busy:
+                raise Refused("会话 %s 正被这些进程占着: %s —— 先在那个窗口退出（Ctrl+C 或 /exit），再续"
+                              % (args.resume, " ".join(map(str, busy))))
+        argv += ["resume", args.resume]
+    env_set = {"NO_PROXY": merge_no_proxy(os.environ.get("NO_PROXY")),
+               "no_proxy": merge_no_proxy(os.environ.get("no_proxy"))}
+    print("Codex → %s（%s/v1）" % (station["name"], station["baseURL"]), file=sys.stderr)
+    if args.print:
+        show(argv, env_set)
+        return 0
+    os.execvpe(argv[0], argv, {**os.environ, **env_set})
+
+
+# -------------------------------------------------------------------- 其它
+def cmd_env(st, args):
+    _data, s = st.find(args.station)
+    env = {"ANTHROPIC_BASE_URL": s["baseURL"], "OPENAI_BASE_URL": s["baseURL"] + "/v1",
+           "NO_PROXY": merge_no_proxy(os.environ.get("NO_PROXY")),
+           "no_proxy": merge_no_proxy(os.environ.get("no_proxy"))}
+    if args.json:
+        print(json.dumps(env, ensure_ascii=False, indent=2))
+        return 0
+    print("# %s 的网关（%s）。本机回环上调用不校验 key。" % (s["name"], s["state"]))
+    print("# Claude Code 不认 shell 里的 ANTHROPIC_BASE_URL（settings.json 会盖掉）：用 mg cc %s。" % s["name"])
+    for k, v in env.items():
+        print("export %s=%s" % (k, shlex.quote(v)))
+    return 0
+
+
+def cmd_web(st, args):
+    proc = st.run("url", args.station, capture=True)
+    if proc.returncode != 0:
+        raise Refused(proc.stderr.strip() or proc.stdout.strip())
+    url = proc.stdout.strip()
+    # 本机 127.0.0.1 的管理口令，按用户规则明文给出
+    print(url)
+    if not args.print:
+        subprocess.run(["open", url] if sys.platform == "darwin" else ["xdg-open", url])
+    return 0
+
+
+def cmd_new(st, args):
+    flags = []
+    for flag, val in (("--port", args.port), ("--web-port", args.web_port), ("--note", args.note), ("--dir", args.dir)):
+        if val is not None:
+            flags += [flag, str(val)]
+    if args.no_web:
+        flags.append("--no-web")
+    return st.run("new", args.station, *flags).returncode
+
+
+def cmd_logs(st, args):
+    _data, s = st.find(args.station)
+    log = Path(s["folder"]) / "serve.log"
+    if not log.is_file():
+        raise Refused("%s 还没有日志: %s" % (s["name"], log))
+    with log.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        fh.seek(max(0, fh.tell() - 512 * 1024))
+        lines = fh.read().decode("utf-8", "replace").splitlines()
+    for line in lines[-args.lines:]:
+        print(redact(line))
+    print("\n%s" % log, file=sys.stderr)
+    return 0
+
+
+# -------------------------------------------------------------------- 入口
+def parser():
+    import argparse
+    p = argparse.ArgumentParser(prog="mg", description=__doc__.split("\n\n")[0],
+                                epilog=__doc__.split("\n", 2)[2], allow_abbrev=False,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="命令")
+
+    def cmd(name, help_):
+        return sub.add_parser(name, help=help_, allow_abbrev=False)
+
+    cmd("ls", "全部网关")
+    c = cmd("up", "起网关")
+    c.add_argument("station", nargs="?")
+    c.add_argument("--all", action="store_true")
+    c = cmd("down", "停网关")
+    c.add_argument("station")
+    c.add_argument("--force", action="store_true", help="受保护的也停")
+    c = cmd("cc", "Claude Code 经这个网关")
+    c.add_argument("station")
+    c.add_argument("-k", "--key", help="profile 名（这个网关有多个调用 key 时必填）")
+    c.add_argument("-r", "--resume", metavar="ID", help="续这个会话")
+    c.add_argument("--print", action="store_true", help="只打印要起的命令")
+    c = cmd("cx", "Codex 经这个网关")
+    c.add_argument("station")
+    c.add_argument("-r", "--resume", metavar="ID", help="续这个会话")
+    c.add_argument("--print", action="store_true", help="只打印要起的命令")
+    c = cmd("env", "export 行")
+    c.add_argument("station")
+    c.add_argument("--json", action="store_true")
+    c = cmd("web", "浏览器里开管理台")
+    c.add_argument("station")
+    c.add_argument("--print", action="store_true", help="只打印链接")
+    c = cmd("new", "建网关")
+    c.add_argument("station")
+    c.add_argument("--port", type=int)
+    c.add_argument("--web-port", type=int)
+    c.add_argument("--no-web", action="store_true")
+    c.add_argument("--note")
+    c.add_argument("--dir")
+    c = cmd("logs", "看日志")
+    c.add_argument("station")
+    c.add_argument("-n", "--lines", type=int, default=40)
+    return p
+
+
+def main(argv):
+    # `--` 之后原样交给客户端（claude / codex 自己的参数）
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    args = parser().parse_args(argv)
+    if extra and args.cmd not in ("cc", "cx"):
+        print("mg %s: 不收 -- 之后的参数" % args.cmd, file=sys.stderr)
+        return 2
+
+    def warn(msg):
+        print("mg: 注意: %s" % msg, file=sys.stderr)
+
+    try:
+        st = Stations(load_config())
+        if args.cmd in ("cc", "cx"):
+            return (cmd_cc if args.cmd == "cc" else cmd_cx)(st, args, extra, warn)
+        return {"ls": cmd_ls, "up": cmd_up, "down": cmd_down, "env": cmd_env,
+                "web": cmd_web, "new": cmd_new, "logs": cmd_logs}[args.cmd](st, args)
+    except Refused as exc:
+        print("mg: %s（什么都没起）" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
