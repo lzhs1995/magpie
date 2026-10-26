@@ -1,0 +1,33 @@
+# mg 的本机设置。复制成 ~/.config/magpie-stations/mg.toml 再改；不进仓库。
+# 每一节、每个键都可以不写，不写就用注释里的默认值。写错的键 mg 会直接报错。
+
+[magpie]
+# 带 `magpie station` 的 magpie（fork 客户端里那个）。
+# 默认：~/Applications/magpie-stations.app 或 /Applications/magpie-stations.app 里的。
+# binary = "~/Applications/magpie-stations.app/Contents/MacOS/magpie"
+#
+# stations.yml。默认跟客户端双击时读的同一份：app 的 Info.plist 里
+# LSEnvironment 的 XDG_CONFIG_HOME/magpie/stations.yml。
+# stations = "~/.config/magpie-stations-view/magpie/stations.yml"
+
+[claude]
+# 起 Claude Code 的命令：一个路径，或一个 argv 列表。mg 在后面接
+# --settings <profile> [--resume <id>] [-- 之后的参数]。默认 "claude"。
+# 本机若有包一层的启动器（记录请求、钉版本），写它。
+# launcher = "~/.local/bin/claude"
+#
+# profile 目录。默认：stations.yml 的 root 下的 profiles/。
+# 每个 profile 是一份 Claude Code settings，env 里 ANTHROPIC_BASE_URL 写网关地址、
+# ANTHROPIC_AUTH_TOKEN 写这个网关的调用 key（网关 Gateway keys 页建的那种）。
+# profiles = "~/.config/magpie-stations/profiles"
+
+[codex]
+# 起 Codex 的命令。默认 $CODEX_BIN，再是 /opt/homebrew/bin/codex，再是 PATH 上的 codex。
+# launcher = "/opt/homebrew/bin/codex"
+#
+# ~/.codex/config.toml 里 model_provider 必须是它，mg 才去覆盖它的 base_url。
+# 不一致就拒绝起：覆盖不生效，请求会绕过网关。默认 "custom"。
+# provider = "custom"
+#
+# Codex 的目录。默认 $CODEX_HOME，再是 ~/.codex。
+# home = "~/.codex"
