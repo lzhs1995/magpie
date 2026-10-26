@@ -253,4 +253,20 @@ magpie.plugin("stations", (ctx) => {
     reload() { return load(); },
     relang() { draw(); },
   });
+
+  // The page's tab in the sidebar, after Gateway's. Added here rather than
+  // written into index.html, so the fork's lines in that file are only its
+  // stylesheet and scripts. setup runs as this script loads, the plugin on
+  // or off (off is data-feature, as for a tab written there), so the tab
+  // is in #nav before app.js binds and translates the tabs it finds.
+  const nav = document.getElementById("nav");
+  if (nav && !nav.querySelector('button[data-view="stations"]')) {
+    const tab = document.createElement("button");
+    tab.dataset.view = "stations";
+    tab.dataset.feature = "stations";
+    tab.innerHTML = '<svg class="nav-ic" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="6" height="6" rx="1.5"/><rect x="11" y="3.5" width="6" height="6" rx="1.5"/><rect x="3" y="11.5" width="6" height="6" rx="1.5"/><path d="M14 12.5v4M12 14.5h4"/></g></svg><span data-t>Stations</span>';
+    const after = nav.querySelector('button[data-view="gateway"]');
+    if (after) after.after(tab);
+    else nav.append(tab);
+  }
 });
