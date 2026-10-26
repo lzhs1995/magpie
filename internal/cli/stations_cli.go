@@ -27,8 +27,9 @@ const stationUsage = `magpie station — the gateways on this computer, a magpie
   magpie station start <name>     start it beside this terminal, as the page's Start does; one serving already is left as it is
   magpie station stop <name> [--force]
                                   stop it (SIGTERM); a protected one only with --force
-  magpie station new <name> [--port N] [--web-port N|--no-web] [--note …] [--dir …]
-                                  a new station, as the page's + makes one: the next free ports from 3500 in tens unless told
+  magpie station new <name> [--port N] [--web-port N|--no-web] [--note …] [--dir …] [--protected] [--env K=V …]
+                                  a new station, as the page's + makes one: the next free ports from 3445 in tens unless told;
+                                  --env puts a variable over its environment (K= takes one out), --protected keeps it from being stopped
   magpie station url <name>       its page's link, signed in with its key
 
 stations.yml is the one MAGPIE_STATIONS names, else the one in this magpie's folder.
@@ -241,8 +242,46 @@ func stationStop(out io.Writer, args []string) error {
 	return nil
 }
 
+// envFlags takes every --env K=V (or --env=K=V) out of args: the station's
+// own variables over NewEnv's, a K= taking the variable out, as a line of
+// stations.yml's env does. A variable said twice is refused, so which one
+// was meant is never guessed.
+func envFlags(args []string) (rest []string, env map[string]string, err error) {
+	env = map[string]string{}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		var kv string
+		switch {
+		case a == "--env":
+			if i+1 >= len(args) {
+				return nil, nil, fmt.Errorf("magpie station new: --env needs a value")
+			}
+			kv = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--env="):
+			kv = a[len("--env="):]
+		default:
+			rest = append(rest, a)
+			continue
+		}
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k == "" {
+			return nil, nil, fmt.Errorf("magpie station new: --env is NAME=value (or NAME= to take it out), not %q", kv)
+		}
+		if _, twice := env[k]; twice {
+			return nil, nil, fmt.Errorf("magpie station new: --env says %s twice", k)
+		}
+		env[k] = v
+	}
+	return rest, env, nil
+}
+
 func stationNew(out io.Writer, args []string) error {
-	name, vals, on, err := stationArgs("new", args, []string{"--port", "--web-port", "--note", "--dir"}, []string{"--no-web"})
+	args, env, err := envFlags(args)
+	if err != nil {
+		return err
+	}
+	name, vals, on, err := stationArgs("new", args, []string{"--port", "--web-port", "--note", "--dir"}, []string{"--no-web", "--protected"})
 	if err != nil {
 		return err
 	}
@@ -287,7 +326,11 @@ func stationNew(out io.Writer, args []string) error {
 	case !gotWeb:
 		w = p + 1
 	}
-	s := stations.Station{Name: name, Port: p, WebPort: w, Note: vals["--note"], Dir: vals["--dir"], Env: stations.NewEnv()}
+	s := stations.Station{Name: name, Port: p, WebPort: w, Note: vals["--note"], Dir: vals["--dir"],
+		Protected: on["--protected"], Env: stations.NewEnv()}
+	for k, v := range env {
+		s.Env[k] = v
+	}
 	f, err := stations.Add(s)
 	if err != nil {
 		return fmt.Errorf("magpie station new: %w", err)
