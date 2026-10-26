@@ -352,10 +352,15 @@ def settings_env_keys():
     return set(env) if isinstance(env, dict) else set()
 
 
+# profile 名：-k 收的、不给 -k 时自动选的、站点页列出的（internal/stations
+# clients.go 的 profileName）是同一条规则，隐藏文件和 _模板 都不算。
+PROFILE_NAME = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+
+
 def pick_profile(cfg, data, station, key):
     folder = profiles_dir(cfg, data)
     if key:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", key):
+        if not re.fullmatch(PROFILE_NAME, key):
             raise Refused("-k 只收 profile 名（字母数字 . _ -），不收路径: %r" % key)
         path = folder / (key + ".json")
         if not path.is_file():
@@ -363,7 +368,7 @@ def pick_profile(cfg, data, station, key):
         return path
     found = []
     for p in sorted(folder.glob("*.json")) if folder.is_dir() else []:
-        if p.name.startswith((".", "_")):
+        if not re.fullmatch(PROFILE_NAME, p.stem):
             continue
         try:
             if profile_env(p).get("ANTHROPIC_BASE_URL", "").rstrip("/") == station["baseURL"]:
