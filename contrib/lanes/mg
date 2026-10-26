@@ -625,13 +625,31 @@ def fetch(url, dest=None, api=False):
     return None
 
 
+def release_list(repo):
+    """release 列表（JSON 文本）。有登录过的 gh 就走 gh api：不登录的 API 每个出口 IP
+    每小时只有 60 次，代理出口是和别人共用的，会 403。MG_RELEASES_API（测试用）优先。"""
+    path = "repos/%s/releases?per_page=30" % repo
+    if not os.environ.get("MG_RELEASES_API") and shutil.which("gh"):
+        proc = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=120)
+        if proc.returncode == 0:
+            return proc.stdout
+        print("mg: 注意: gh api 失败（%s），改用不登录的 API" % proc.stderr.strip()[:200], file=sys.stderr)
+    api = os.environ.get("MG_RELEASES_API") or "https://api.github.com/" + path
+    try:
+        return fetch(api, api=True)
+    except urllib.error.HTTPError as exc:
+        hint = "；不登录的 API 按出口 IP 限 60 次/小时，`gh auth login` 后 mg 改走 gh" if exc.code in (403, 429) else ""
+        raise Refused("读不到 release 列表（%s）: %s%s" % (api, exc, hint))
+    except OSError as exc:
+        raise Refused("读不到 release 列表（%s）: %s" % (api, exc))
+
+
 def latest_release(repo):
     """最新的 stations-* release（不是草稿、不是预发布、两个附件都在）。"""
-    api = os.environ.get("MG_RELEASES_API") or "https://api.github.com/repos/%s/releases?per_page=30" % repo
     try:
-        releases = json.loads(fetch(api, api=True))
-    except (OSError, ValueError) as exc:
-        raise Refused("读不到 release 列表（%s）: %s" % (api, exc))
+        releases = json.loads(release_list(repo))
+    except ValueError as exc:
+        raise Refused("release 列表不是 JSON: %s" % exc)
     if not isinstance(releases, list):
         raise Refused("release 列表不是列表: %s" % str(releases)[:200])
     found = []
