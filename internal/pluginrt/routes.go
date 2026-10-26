@@ -20,6 +20,17 @@ import (
 // routesMu guards the mounted routes of every plugin.
 var routesMu sync.RWMutex
 
+// routeTable is a Runtime's plugin routes, under RoutePrefix: mux is the
+// matcher, routed the handler each pattern has now, and mounted the
+// patterns the matcher already holds, since a ServeMux takes a pattern
+// once and never gives it back. Kept here, beside the code that uses it,
+// so the Runtime itself carries one field for it.
+type routeTable struct {
+	mux     *http.ServeMux
+	routed  map[string]http.Handler
+	mounted map[string]bool
+}
+
 // Handle gives the plugin a route of its own, below its own prefix: the
 // pattern is `[METHOD ]path`, where path is relative to the plugin's
 // prefix, so "GET stations" of the plugin `stations` is
@@ -33,12 +44,13 @@ func (c *Ctx) Handle(pattern string, h http.Handler) {
 	}
 	full := method + RoutePrefix + c.ID + "/" + path
 	routesMu.Lock()
-	if c.rt.routes == nil {
-		c.rt.routes = http.NewServeMux()
-		c.rt.routed = map[string]http.Handler{}
-		c.rt.mounted = map[string]bool{}
+	t := &c.rt.routes
+	if t.mux == nil {
+		t.mux = http.NewServeMux()
+		t.routed = map[string]http.Handler{}
+		t.mounted = map[string]bool{}
 	}
-	if _, seen := c.rt.routed[full]; seen {
+	if _, seen := t.routed[full]; seen {
 		routesMu.Unlock()
 		panic("pluginrt: " + c.ID + ": the route " + full + " is registered twice")
 	}
@@ -47,16 +59,16 @@ func (c *Ctx) Handle(pattern string, h http.Handler) {
 	// without the pattern having to come back out of the mux — which a
 	// ServeMux can't do, and which registering it again after the plugin
 	// came back on would panic over.
-	c.rt.routed[full] = h
-	if !c.rt.mounted[full] {
-		c.rt.mounted[full] = true
-		c.rt.routes.Handle(full, lookup{rt: c.rt, key: full})
+	t.routed[full] = h
+	if !t.mounted[full] {
+		t.mounted[full] = true
+		t.mux.Handle(full, lookup{t: t, key: full})
 	}
-	rt, key := c.rt, full
+	key := full
 	routesMu.Unlock()
 	c.OnDispose(func() {
 		routesMu.Lock()
-		delete(rt.routed, key)
+		delete(t.routed, key)
 		routesMu.Unlock()
 	})
 }
@@ -86,13 +98,13 @@ func splitPattern(pattern string) (method, path string) {
 // lookup answers with whatever handler is registered for key now, and 404
 // once the plugin that registered it is off.
 type lookup struct {
-	rt  *Runtime
+	t   *routeTable
 	key string
 }
 
 func (l lookup) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	routesMu.RLock()
-	h := l.rt.routed[l.key]
+	h := l.t.routed[l.key]
 	routesMu.RUnlock()
 	if h == nil {
 		http.NotFound(rw, r)
@@ -110,8 +122,8 @@ func (rt *Runtime) Routes() http.Handler {
 	}
 	routesMu.RLock()
 	defer routesMu.RUnlock()
-	if rt.routes == nil {
+	if rt.routes.mux == nil {
 		return nil
 	}
-	return rt.routes
+	return rt.routes.mux
 }
