@@ -23,6 +23,11 @@ mg logs <站> -n 60
 它，也不自己拼网关的启动环境，全部经 fork 的 `magpie station …`（同一份 Go 代码）。
 所以 mg 起的网关和页面「启动」起的、和 `magpie serve --station` 起的是同一个。
 
+站点页每个网关下有「用它开 Claude Code」「用它开 Codex」两种行，点「复制」得到
+`mg cc <站> -k <profile>`（每个打给这个网关的 profile 一行）和 `mg cx <站>`。还没有
+profile 时给 `mg cc <站>`，跑了它会说该建什么。页面看的是 stations.yml 的 root 下的
+`profiles/`；mg.toml 里改了 `[claude] profiles` 的话，页面上的这几行不跟着变。
+
 ### 装
 
 ```sh
