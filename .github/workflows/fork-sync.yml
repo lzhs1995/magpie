@@ -8,9 +8,10 @@ name: Fork sync
 # 分成两个 job：build 跑上游的代码（测试、构建），不拿任何写权限和 secret；
 # publish 只做 git 推送和发布，不执行仓库里的任何代码。
 #
-# 推送里带着上游 .github/workflows 的改动，GITHUB_TOKEN 推不了这种提交，所以推送用
-# secret FORK_SYNC_TOKEN：fine-grained token，只给 lzhs1995/magpie 的 Contents 和
-# Workflows 读写。没有它时 publish 失败，issue 里会说明。
+# 推送里带着上游 .github/workflows 的改动，GITHUB_TOKEN 推不了这种提交。推送用
+# secret FORK_SYNC_DEPLOY_KEY：只属于 lzhs1995/magpie 的一把可写 deploy key（SSH
+# 私钥），碰不到别的仓库；没有它时用 secret FORK_SYNC_TOKEN（fine-grained token，
+# 只给本仓库 Contents 与 Workflows 读写）。两个都没有时 publish 失败，issue 里会说明。
 
 on:
   schedule:
@@ -191,16 +192,31 @@ jobs:
       - name: Push the rebased branch
         if: steps.dist.outcome == 'success' && env.STATUS == 'rebased'
         env:
+          DEPLOY_KEY: ${{ secrets.FORK_SYNC_DEPLOY_KEY }}
           TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          # github.com 公布的 ed25519 主机公钥（api.github.com/meta），钉死在这里
+          # 而不是推送时现扫，扫到的是谁就信谁
+          GITHUB_HOST_KEY: github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
         run: |
-          [ -n "$TOKEN" ] || { echo "::error::secret FORK_SYNC_TOKEN isn't set: the rebased branch carries upstream's workflow changes, which GITHUB_TOKEN may not push"; exit 1; }
+          if [ -n "$DEPLOY_KEY" ]; then
+            key="$RUNNER_TEMP/deploy_key" hosts="$RUNNER_TEMP/known_hosts"
+            trap 'rm -f "$key"' EXIT
+            (umask 077 && printf '%s\n' "$DEPLOY_KEY" > "$key")
+            printf '%s\n' "$GITHUB_HOST_KEY" > "$hosts"
+            export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$hosts"
+            remote="git@github.com:$GITHUB_REPOSITORY.git"
+          elif [ -n "$TOKEN" ]; then
+            remote="https://x-access-token:$TOKEN@github.com/$GITHUB_REPOSITORY.git"
+          else
+            echo "::error::neither secret FORK_SYNC_DEPLOY_KEY nor FORK_SYNC_TOKEN is set: the rebased branch carries upstream's workflow changes, which GITHUB_TOKEN may not push"
+            exit 1
+          fi
           (cd "$RUNNER_TEMP/dist" && sha256sum -c SHA256SUMS)
           git fetch --quiet "$UPSTREAM" main
           git fetch --quiet "$RUNNER_TEMP/rebased.bundle" "refs/heads/$BRANCH:refs/rebased"
           [ "$(git rev-parse refs/rebased)" = "$AFTER" ] || { echo "the bundle isn't $AFTER"; exit 1; }
           # 只在远端还是 rebase 开始时那个提交时才覆盖：期间有人推过就不动
-          git push --force-with-lease="$BRANCH:$BEFORE" \
-            "https://x-access-token:$TOKEN@github.com/$GITHUB_REPOSITORY.git" "refs/rebased:refs/heads/$BRANCH"
+          git push --force-with-lease="$BRANCH:$BEFORE" "$remote" "refs/rebased:refs/heads/$BRANCH"
 
       - name: Release
         if: steps.dist.outcome == 'success'
@@ -253,7 +269,7 @@ jobs:
               echo "- 测试与构建（build）：$BUILD"
               echo "- 推送与发布（publish）：$PUBLISH"
               if [ "$STATUS" = bad-version ]; then echo "- rebase 后的版本号不是 git describe 形状，客户端会把它当正式版去下官方更新，所以没构建"; fi
-              if [ "$PUBLISH" = failure ] && [ "$STATUS" = rebased ]; then echo "- 推送 rebase 后的分支要 secret FORK_SYNC_TOKEN：fine-grained token，只给 lzhs1995/magpie 的 Contents 与 Workflows 读写"; fi
+              if [ "$PUBLISH" = failure ] && [ "$STATUS" = rebased ]; then echo "- 推送 rebase 后的分支要 secret FORK_SYNC_DEPLOY_KEY（本仓库可写 deploy key 的私钥）或 FORK_SYNC_TOKEN（fine-grained token，只给 lzhs1995/magpie 的 Contents 与 Workflows 读写）"; fi
             } > "$body"
           fi
           printf '\n运行记录：%s\n' "$RUN" >> "$body"
