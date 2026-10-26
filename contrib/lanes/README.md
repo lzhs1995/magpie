@@ -1,7 +1,89 @@
+# mg 与 magpie-lanes
+
+## mg：用哪个网关、开或续哪个客户端，一条命令
+
+```sh
+mg ls                          # 全部网关：状态、pid、钉着几个客户端、网关/管理台地址
+mg up <站>                     # 起它（已在服务就不动）；mg up --all
+mg down <站>                   # 停它；受保护的要 --force
+mg cc <站> -k <key>            # Claude Code 经这个网关开新会话
+mg cc <站> -k <key> -r <id>    # 续会话
+mg cx <站>                     # Codex 经这个网关开新会话
+mg cx <站> -r <id>             # 续会话
+mg env <站>                    # 给别的工具用的 export 行
+mg web <站>                    # 浏览器里开管理台（带口令登录）
+mg new <站>                    # 新网关：端口、目录、口令都给好
+mg logs <站> -n 60
+```
+
+`cc` / `cx` / `web` 都可加 `--print`：只打印要起的命令，什么都不起。`--` 之后的
+参数原样交给客户端（`mg cc linxi -k linxi-s1 -- --model opus`）。
+
+**网关清单只有一份：stations.yml**，就是客户端「网关站点」页那份。mg 不自己解析
+它，也不自己拼网关的启动环境，全部经 fork 的 `magpie station …`（同一份 Go 代码）。
+所以 mg 起的网关和页面「启动」起的、和 `magpie serve --station` 起的是同一个。
+
+### 装
+
+```sh
+ln -s "$PWD/contrib/lanes/mg" ~/.local/bin/mg          # 或别的 PATH 目录
+cp contrib/lanes/mg.toml.example ~/.config/magpie-stations/mg.toml   # 可选，本机设置
+```
+
+要 fork 客户端（magpie-stations.app，带 `magpie station`）和 Python 3.11+。
+stations.yml 默认读客户端双击时读的那份（app 的 LSEnvironment），不用配。
+
+### mg 替你守的规矩
+
+- **只起新的客户端进程。** 不改 `~/.claude/settings.json`、`~/.codex/config.toml`，
+  不碰任何网关的 `providers.json`：上游 URL 和上游 key 一个不换。
+- **NO_PROXY 必带回环。** `.zshrc` 把 `HTTP(S)_PROXY` 指向 7897，codex 会把
+  127.0.0.1 也交给它（502）。mg 把 `127.0.0.1,localhost,::1` 放最前，原有的不丢。
+- **Claude Code 走 `--settings <profile>`，不走 export。** 本机 `settings.json`
+  的 env 块会盖掉 shell 里的 `ANTHROPIC_BASE_URL`。profile 里没写的键会从
+  `settings.json` 逐键渗进来，所以 `mg cc` 起之前核：
+  - profile 打给的就是这个网关；
+  - 带的是这个网关自己的调用 key（`caller-keys.json` 里有；站点目录里没有这个
+    文件时只提醒）；
+  - `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY`、
+    `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 自己写明了。
+  任一条不满足就拒绝，什么都不起。压缩窗口、`ANTHROPIC_BETAS` 这类不改请求
+  打给谁的键，profile 没写而 `settings.json` 写了时只提醒。
+- **Codex 只覆盖 base_url。** `-c model_providers.custom.base_url=…/v1`。
+  `config.toml` 的 `model_provider` 不是 `custom` 时覆盖不生效，请求会绕过网关，
+  所以 mg 拒绝起。
+- **续会话前先查占用。** Claude 的会话已有进程在 `--resume`，或 Codex 的 rollout
+  被别的进程开着，就拒绝。先在那个窗口退出再续。
+
+### 加第 N 个网关
+
+```sh
+mg new work                      # 端口从 3500 起每次 +10，页面端口 = 网关 +1
+# 管理台里加上游 provider 和 key：
+mg web work
+mg up work
+# Claude Code 要一个 profile：网关的 Gateway keys 页建一个调用 key，
+# 复制现有 profile，ANTHROPIC_BASE_URL 改成新网关、ANTHROPIC_AUTH_TOKEN 改成那个 key
+mg cc work -k work-s1 --print    # 先看一眼
+```
+
+### 跟 magpie-lanes 的关系
+
+`mg` 接手了起停和接客户端。`magpie-lanes` 的 `routing` / `keys` / `edit` / `open`
+照旧可用，读的仍是 lanes.toml。有两处不一致，用 mg：
+
+- lanes.toml 的 `no_proxy` 是全局一个值，linxi / baibei 实际跑的是带
+  `k40.shengqainbang.cn` 的。`magpie-lanes up` 起它们时，环境会和现在在跑的不同。
+  stations.yml 里每站各写各的，`mg up` 读它。
+- `magpie-lanes use` 的 Claude Code 写法是 export `ANTHROPIC_BASE_URL`，本机不生效
+  （见上）。用 `mg cc`。
+
+---
+
 # magpie-lanes —— 并行通道监督器
 
-一条命令管多条 magpie 通道。**magpie 本体零改动**，所以 `git merge upstream/main`
-永远干净。
+一条命令管多条 magpie 通道。magpie-lanes 本身不改 magpie。上面的 `mg` 要用 fork 的
+`magpie station`。
 
 ## 为什么需要它
 
