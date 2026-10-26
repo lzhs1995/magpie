@@ -12,6 +12,8 @@
     mg web <站> [--print]         浏览器里开它的管理台（带口令登录）
     mg new <站> [--port N] [--note …]   建一个新网关（端口、目录、口令都给好）
     mg logs <站> [-n N]           看它的 serve.log（抹掉口令）
+    mg upgrade [--check] [--wait 秒]   管理台换成最新的 stations-* release
+                                  （核 SHA；只在管理台零连接时重启它；网关不碰）
 
 铁律（每条都由本工具强制，不靠记性）：
 - 只起新的客户端进程。不改 ~/.claude/settings.json、~/.codex/config.toml，
@@ -29,13 +31,20 @@
   $MG_CONFIG → ~/.config/magpie-stations/mg.toml → 与本文件同目录的 mg.toml
 """
 
+import hashlib
 import hmac
 import json
 import os
+import plistlib
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # tomllib 要 3.11+。系统 python3 是 3.9，找一个带 tomllib 的重新 exec（同 magpie-lanes）。
@@ -77,7 +86,8 @@ def load_config():
     """mg.toml，没有就全用默认值。只认这几节，别的键报错，免得写错了没生效。"""
     known = {"magpie": {"binary", "stations"},
              "claude": {"launcher", "profiles"},
-             "codex": {"launcher", "provider", "home"}}
+             "codex": {"launcher", "provider", "home"},
+             "upgrade": {"repo", "min_free_gb"}}
     for cand in (os.environ.get("MG_CONFIG"),
                  str(Path.home() / ".config" / "magpie-stations" / "mg.toml"),
                  str(HERE / "mg.toml")):
@@ -134,7 +144,6 @@ def stations_file(cfg, binary):
         return str(Path(want).expanduser())
     plist = Path(binary).parent.parent / "Info.plist"
     if plist.is_file():
-        import plistlib
         try:
             with plist.open("rb") as fh:
                 env = plistlib.load(fh).get("LSEnvironment") or {}
@@ -535,6 +544,417 @@ def cmd_logs(st, args):
     return 0
 
 
+# -------------------------------------------------------------------- 升级管理台
+# release 由 fork 的 .github/workflows/fork-sync.yml 每天发：tag stations-<版本>，
+# 附 magpie-darwin-arm64 与 SHA256SUMS。只换 .app 里的 magpie 和 Info.plist 的版本号；
+# 网关跑的是官方 magpie.app 的二进制，本命令一个都不碰。
+RELEASE_REPO = "lzhs1995/magpie"
+RELEASE_ASSET = "magpie-darwin-arm64"
+RELEASE_SUMS = "SHA256SUMS"
+RELEASE_TAG = "stations-"
+OFFICIAL_BUNDLE_ID = "com.yetone.magpie"
+# 只认 git describe 的预发布形状：update.Released 见到它返回 false，官方自动更新
+# 才不会把 fork 客户端换回官方版。带 -dirty 的不是 CI 出的，也不认。
+DESCRIBE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)-(\d+)-g[0-9a-f]{7,}$")
+# 系统工具用绝对路径：PATH 里的 open 可能是终端程序包的一层壳。
+SYSTEM_TOOLS = {
+    "open": "/usr/bin/open",
+    "codesign": "/usr/bin/codesign",
+    "lsregister": "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
+                  "LaunchServices.framework/Versions/A/Support/lsregister",
+}
+
+
+class UpgradeFailed(Exception):
+    """已经动过 .app 之后的失败：要回滚。"""
+
+
+def tool(name):
+    """MG_TOOLS_DIR（测试用）设了就只在那里找，找不到也不回落到真工具 ——
+    免得测试把临时 .app 注册进本机 LaunchServices。"""
+    d = os.environ.get("MG_TOOLS_DIR")
+    p = str(Path(d) / name) if d else SYSTEM_TOOLS[name]
+    if not os.access(p, os.X_OK):
+        raise Refused("找不到 %s: %s" % (name, p))
+    return p
+
+
+def app_bundle(binary):
+    """binary 所在的 .app 和它的 Info.plist；不是 .app 里的、或是官方 magpie.app，就拒绝。"""
+    b = Path(binary)
+    app = b.parent.parent.parent
+    if b.parent.name != "MacOS" or b.parent.parent.name != "Contents" or app.suffix != ".app":
+        raise Refused("%s 不在 .app 里，没法当管理台升级" % binary)
+    plist = app / "Contents" / "Info.plist"
+    if not plist.is_file():
+        raise Refused("%s 没有 Info.plist" % app)
+    with plist.open("rb") as fh:
+        info = plistlib.load(fh)
+    if info.get("CFBundleIdentifier") == OFFICIAL_BUNDLE_ID:
+        raise Refused("%s 是官方 magpie.app（网关在用它），不升级" % app)
+    return app, plist, info
+
+
+def binary_version(binary):
+    """`magpie --version` 印的版本号；跑不了或不是 `magpie <版本>` 就是 None。"""
+    try:
+        proc = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    parts = proc.stdout.split()
+    if proc.returncode != 0 or len(parts) != 2 or parts[0] != "magpie":
+        return None
+    return parts[1]
+
+
+def describe_key(version):
+    m = DESCRIBE.match(version or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def fetch(url, dest=None, api=False):
+    """GET url：dest 为 None 时返回字节，否则流式写进 dest。走环境里的代理设置。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "mg-upgrade"})
+    if api:
+        req.add_header("Accept", "application/vnd.github+json")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        if dest is None:
+            return resp.read()
+        with open(dest, "wb") as fh:
+            shutil.copyfileobj(resp, fh, 1 << 20)
+    return None
+
+
+def latest_release(repo):
+    """最新的 stations-* release（不是草稿、不是预发布、两个附件都在）。"""
+    api = os.environ.get("MG_RELEASES_API") or "https://api.github.com/repos/%s/releases?per_page=30" % repo
+    try:
+        releases = json.loads(fetch(api, api=True))
+    except (OSError, ValueError) as exc:
+        raise Refused("读不到 release 列表（%s）: %s" % (api, exc))
+    if not isinstance(releases, list):
+        raise Refused("release 列表不是列表: %s" % str(releases)[:200])
+    found = []
+    for r in releases:
+        tag = r.get("tag_name") or ""
+        if r.get("draft") or r.get("prerelease") or not tag.startswith(RELEASE_TAG):
+            continue
+        assets = {a.get("name"): a for a in r.get("assets") or []}
+        if RELEASE_ASSET in assets and RELEASE_SUMS in assets:
+            found.append({"tag": tag, "version": tag[len(RELEASE_TAG):],
+                          "published": r.get("published_at") or "",
+                          "asset": assets[RELEASE_ASSET]["browser_download_url"],
+                          "size": int(assets[RELEASE_ASSET].get("size") or 0),
+                          "sums": assets[RELEASE_SUMS]["browser_download_url"]})
+    if not found:
+        raise Refused("%s 还没有带 %s 和 %s 的 %s* release" % (repo, RELEASE_ASSET, RELEASE_SUMS, RELEASE_TAG))
+    return max(found, key=lambda r: r["published"])
+
+
+def download_verified(rel, stage):
+    """下到 stage：SHA256 要和 SHA256SUMS 一致，`--version` 要正是 release 的版本。"""
+    try:
+        sums = fetch(rel["sums"]).decode("utf-8", "replace")
+    except OSError as exc:
+        raise Refused("下载 %s 失败: %s" % (RELEASE_SUMS, exc))
+    want = [ln.split()[0].lower() for ln in sums.splitlines()
+            if len(ln.split()) == 2 and ln.split()[1].lstrip("*") == RELEASE_ASSET]
+    if len(want) != 1 or not re.fullmatch(r"[0-9a-f]{64}", want[0]):
+        raise Refused("%s 里没有唯一一行 %s 的 SHA256" % (RELEASE_SUMS, RELEASE_ASSET))
+    new = stage / RELEASE_ASSET
+    try:
+        fetch(rel["asset"], new)
+    except OSError as exc:
+        raise Refused("下载 %s 失败: %s" % (RELEASE_ASSET, exc))
+    with new.open("rb") as fh:
+        got = hashlib.file_digest(fh, "sha256").hexdigest()
+    if got != want[0]:
+        raise Refused("SHA256 对不上：下到的是 %s，%s 写的是 %s" % (got, RELEASE_SUMS, want[0]))
+    new.chmod(0o755)
+    ver = binary_version(new)
+    if ver != rel["version"]:
+        raise Refused("下到的二进制自报 %s，release 是 %s" % (ver, rel["version"]))
+    return new
+
+
+def console_addr(info):
+    """管理台监听在哪：Info.plist 的 LSEnvironment MAGPIE_ADDR（双击时就用它）。"""
+    addr = (info.get("LSEnvironment") or {}).get("MAGPIE_ADDR") or ""
+    host, _, port = addr.rpartition(":")
+    if host not in LOOPBACK or not port.isdigit():
+        raise Refused("Info.plist 的 MAGPIE_ADDR 不是本机回环地址: %r" % addr)
+    return host, int(port)
+
+
+def tcp(port, state):
+    """lsof 列出 TCP 端口 port 上某状态的套接字：[(pid, 程序名, 地址)]。"""
+    proc = subprocess.run(["lsof", "-nP", "-iTCP:%d" % port, "-sTCP:" + state, "-Fpcn"],
+                          capture_output=True, text=True)
+    if proc.returncode not in (0, 1) or (proc.returncode == 1 and proc.stderr.strip()):
+        raise Refused("lsof 失败: %s" % proc.stderr.strip())
+    out, pid, comm = [], None, ""
+    for line in proc.stdout.splitlines():
+        if line[:1] == "p":
+            pid, comm = int(line[1:]), ""
+        elif line[:1] == "c":
+            comm = line[1:]
+        elif line[:1] == "n" and pid is not None:
+            out.append((pid, comm, line[1:]))
+    return out
+
+
+def launched_from(pid, binary):
+    """这个进程是不是从 binary 起的（参数里有这个路径）。参数只在本进程内比对，不打印。"""
+    args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(args) and (" %s " % binary) in (" %s " % args)
+
+
+def console_state(binary, port):
+    """(管理台 pid 或 None, 连着它的客户端 ["程序名(pid)"])。端口被别的程序占着就拒绝。"""
+    pids = sorted({pid for pid, _c, _n in tcp(port, "LISTEN")})
+    if not pids:
+        return None, []
+    if len(pids) > 1 or not launched_from(pids[0], binary):
+        raise Refused("端口 %d 被别的程序占着（pid %s），不是 %s" % (port, ",".join(map(str, pids)), binary))
+    pid, suffix = pids[0], ":%d" % port
+    served, clients = 0, []
+    for p, comm, name in tcp(port, "ESTABLISHED"):
+        local, _, remote = name.partition("->")
+        if p == pid and local.endswith(suffix):
+            served += 1
+        elif remote.endswith(suffix):
+            clients.append("%s(%d)" % (comm, p))
+    # 看不到名字的客户端（别的用户的进程）也算：按管理台这一端的套接字数
+    clients += ["?"] * max(0, served - len(clients))
+    return pid, clients
+
+
+def wait_gone(pid, seconds):
+    """等 pid 退出，最多 seconds 秒。不 SIGKILL：它退出时要收尾。"""
+    start = time.monotonic()
+    shown = 0
+    while time.monotonic() - start < seconds:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        waited = int(time.monotonic() - start)
+        if waited >= shown + 60:
+            shown = waited
+            print("  还在等 pid %d 退出（%d 秒）…" % (pid, waited))
+        time.sleep(0.5)
+    return False
+
+
+def upgrades_dir():
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "magpie-stations" / "upgrades"
+
+
+def back_up(binary, plist, version):
+    """旧二进制和 Info.plist 拷一份，回滚就用它。"""
+    d = upgrades_dir() / ("%s-%s" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), version or "unknown"))
+    d.mkdir(parents=True)
+    shutil.copyfile(binary, d / "magpie")
+    shutil.copyfile(plist, d / "Info.plist")
+    return d
+
+
+def prune_backups(keep=2):
+    """只留最近 keep 份（目录名以 UTC 时间打头，按名字排就是按时间）。"""
+    olds = sorted(p for p in upgrades_dir().iterdir() if p.is_dir() and not p.name.startswith("."))
+    for p in olds[:-keep]:
+        shutil.rmtree(p)
+
+
+def put(src, dest, mode):
+    """src 的内容原子地换进 dest（同目录临时文件 + rename；运行中的旧进程不受影响）。"""
+    tmp = dest.with_name("." + dest.name + ".mg-new")
+    try:
+        shutil.copyfile(src, tmp)
+        tmp.chmod(mode)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def swap_in(new, binary, plist, version):
+    put(new, Path(binary), 0o755)
+    with plist.open("rb") as fh:
+        info = plistlib.load(fh)
+    info["CFBundleShortVersionString"] = info["CFBundleVersion"] = version
+    if info.pop("CFBundleURLTypes", None) is not None:
+        # fork 客户端不认 magpie:// 链接，免得抢走官方 magpie.app 的
+        print("mg: 注意: 去掉了 Info.plist 里的 CFBundleURLTypes", file=sys.stderr)
+    tmp = plist.with_name(".Info.plist.mg-new")
+    with tmp.open("wb") as fh:
+        plistlib.dump(info, fh)
+    os.replace(tmp, plist)
+
+
+def resign(app):
+    """改过包内文件，ad-hoc 重签并重新登记给 LaunchServices。"""
+    for argv in ([tool("codesign"), "--force", "--deep", "-s", "-", str(app)],
+                 [tool("codesign"), "--verify", "--deep", "--strict", str(app)],
+                 [tool("lsregister"), "-f", str(app)]):
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise UpgradeFailed("%s 失败: %s" % (os.path.basename(argv[0]), proc.stderr.strip()))
+
+
+def start(app):
+    """用不带参数的 open 起它：LSEnvironment 才会生效，和双击一样。"""
+    proc = subprocess.run([tool("open"), str(app)], capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise UpgradeFailed("open 失败: %s" % proc.stderr.strip())
+
+
+def wait_up(binary, host, port, seconds=60):
+    """等管理台监听，并且 GET / 回 200。回别的状态码就是起坏了，不再等。"""
+    url = "http://%s:%d/" % ("[%s]" % host if ":" in host else host, port)
+    plain = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline, last = time.monotonic() + seconds, "端口 %d 没有在监听" % port
+    while time.monotonic() < deadline:
+        try:
+            pid, _clients = console_state(binary, port)
+        except Refused as exc:
+            pid, last = None, str(exc)
+        if pid:
+            try:
+                with plain.open(url, timeout=15) as resp:
+                    code = resp.status
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+            except OSError as exc:
+                code, last = None, "GET %s: %s" % (url, exc)
+            if code == 200:
+                return pid
+            if code is not None:
+                raise UpgradeFailed("新管理台起来了，但 GET %s 回 %d" % (url, code))
+        time.sleep(0.5)
+    raise UpgradeFailed("%d 秒内没起来：%s" % (seconds, last))
+
+
+def roll_back(ctx, started):
+    """换回备份；新的已经起了就先停它；原来在跑就把旧的起回来。返回一句结果。"""
+    if started:
+        pid, _clients = console_state(ctx["binary"], ctx["port"])
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+            if not wait_gone(pid, ctx["wait"]):
+                raise UpgradeFailed("新管理台 pid %d 在 %d 秒内没退出" % (pid, ctx["wait"]))
+    put(ctx["backup"] / "magpie", Path(ctx["binary"]), 0o755)
+    put(ctx["backup"] / "Info.plist", ctx["plist"], 0o644)
+    resign(ctx["app"])
+    if not ctx["was_running"]:
+        return "已换回 %s（管理台原来就没在跑，没起它）" % ctx["installed"]
+    start(ctx["app"])
+    pid = wait_up(ctx["binary"], ctx["host"], ctx["port"])
+    return "已换回 %s，管理台 pid %d" % (ctx["installed"], pid)
+
+
+def finish_later(pid, app):
+    """旧管理台迟迟不退：交给一个后台小进程，等它退了再起新的（只起，不再 kill 任何东西）。"""
+    script = 'while kill -0 "$1" 2>/dev/null; do sleep 2; done; exec "$2" "$3"'
+    subprocess.Popen(["/bin/sh", "-c", script, "mg-upgrade-finish", str(pid), tool("open"), str(app)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def cmd_upgrade(st, args):
+    conf = st.cfg.get("upgrade", {})
+    repo, min_free_gb = conf.get("repo", RELEASE_REPO), conf.get("min_free_gb", 20)
+    if not isinstance(repo, str) or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        raise Refused("mg.toml 的 [upgrade] repo 要写成 owner/name")
+    if isinstance(min_free_gb, bool) or not isinstance(min_free_gb, (int, float)) or min_free_gb < 0:
+        raise Refused("mg.toml 的 [upgrade] min_free_gb 要是不小于 0 的数")
+    binary = st.binary
+    app, plist, info = app_bundle(binary)
+    host, port = console_addr(info)
+    installed = binary_version(binary)
+    rel = latest_release(repo)
+    pid, clients = console_state(binary, port)
+    print("管理台 %s" % app)
+    print("  装着的   %s" % (installed or "（读不出版本）"))
+    print("  最新     %s（%s）" % (rel["version"], rel["tag"]))
+    print("  %s:%d   %s" % (host, port, ("pid %d，%d 个连接" % (pid, len(clients))) if pid else "没在跑"))
+    if installed == rel["version"]:
+        print("已是最新，什么都没动。")
+        return 0
+    if not describe_key(rel["version"]):
+        raise Refused("%s 的版本号不是 git describe 形状，装了会被官方自动更新换掉" % rel["tag"])
+    if describe_key(installed) and describe_key(installed) > describe_key(rel["version"]):
+        raise Refused("装着的 %s 比 release 的 %s 新，不降级" % (installed, rel["version"]))
+    if args.check:
+        return 0
+    for name in SYSTEM_TOOLS:  # 换包之后才发现缺工具就回滚不了了
+        tool(name)
+    if clients:
+        raise Refused("管理台上还有 %d 个连接（%s）。关掉它们再跑 mg upgrade" % (len(clients), ", ".join(clients[:5])))
+    upgrades_dir().mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(upgrades_dir()).free
+    need = min_free_gb * 1e9 + 3 * rel["size"]
+    if free < need:
+        raise Refused("磁盘只剩 %.1f GB，升级后要留够 %s GB" % (free / 1e9, min_free_gb))
+    stage = upgrades_dir() / (".stage-%d" % os.getpid())
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir()
+    try:
+        new = download_verified(rel, stage)
+        print("  已下载并核过 SHA256 与 --version")
+        pid, clients = console_state(binary, port)  # 下载期间可能有人连上了
+        if clients:
+            raise Refused("下载期间管理台上来了 %d 个连接（%s）" % (len(clients), ", ".join(clients[:5])))
+        ctx = {"binary": binary, "app": app, "plist": plist, "host": host, "port": port, "wait": args.wait,
+               "installed": installed, "was_running": bool(pid),
+               "backup": back_up(binary, plist, installed)}
+        return upgrade_swap(ctx, new, rel["version"])
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def upgrade_swap(ctx, new, version):
+    """备份已做好：换包、重签；原来在跑就趁零连接重启它。之后的任何失败都回滚。"""
+    started = False
+    try:
+        swap_in(new, ctx["binary"], ctx["plist"], version)
+        resign(ctx["app"])
+        if binary_version(ctx["binary"]) != version:
+            raise UpgradeFailed("换进去的二进制不是 %s" % version)
+        print("  已换包并重签")
+        if not ctx["was_running"]:
+            prune_backups()
+            print("完成：%s → %s。管理台原来没在跑，没起它。" % (ctx["installed"], version))
+            return 0
+        pid, clients = console_state(ctx["binary"], ctx["port"])
+        if clients:
+            raise UpgradeFailed("重启前管理台上来了 %d 个连接（%s）" % (len(clients), ", ".join(clients[:5])))
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+            print("  已给旧管理台 pid %d 发 SIGTERM，最多等 %d 秒" % (pid, ctx["wait"]))
+            if not wait_gone(pid, ctx["wait"]):
+                finish_later(pid, ctx["app"])
+                prune_backups()
+                print("旧管理台 pid %d 在 %d 秒内没退出。新版 %s 已经装好，后台会等它退出后起新的"
+                      "（不会 kill 它）；之后用 mg upgrade --check 看结果。" % (pid, ctx["wait"], version))
+                return 1
+        started = True
+        start(ctx["app"])
+        new_pid = wait_up(ctx["binary"], ctx["host"], ctx["port"])
+    except (UpgradeFailed, Refused, OSError, subprocess.SubprocessError) as exc:
+        print("mg: 升级失败：%s。回滚中…" % exc, file=sys.stderr)
+        try:
+            print("mg: %s" % roll_back(ctx, started), file=sys.stderr)
+        except (UpgradeFailed, Refused, OSError, subprocess.SubprocessError) as exc2:
+            print("mg: 回滚也失败了：%s。备份在 %s（magpie 与 Info.plist）" % (exc2, ctx["backup"]), file=sys.stderr)
+        return 1
+    prune_backups()
+    print("完成：%s → %s，管理台 pid %d。网关没动。" % (ctx["installed"], version, new_pid))
+    return 0
+
+
 # -------------------------------------------------------------------- 入口
 def parser():
     import argparse
@@ -578,6 +998,9 @@ def parser():
     c = cmd("logs", "看日志")
     c.add_argument("station")
     c.add_argument("-n", "--lines", type=int, default=40)
+    c = cmd("upgrade", "管理台换成最新 release")
+    c.add_argument("--check", action="store_true", help="只看版本和连接，不下载、不换")
+    c.add_argument("--wait", type=int, default=900, metavar="秒", help="等旧管理台退出的上限（默认 900）")
     return p
 
 
@@ -600,9 +1023,9 @@ def main(argv):
         if args.cmd in ("cc", "cx"):
             return (cmd_cc if args.cmd == "cc" else cmd_cx)(st, args, extra, warn)
         return {"ls": cmd_ls, "up": cmd_up, "down": cmd_down, "env": cmd_env,
-                "web": cmd_web, "new": cmd_new, "logs": cmd_logs}[args.cmd](st, args)
+                "web": cmd_web, "new": cmd_new, "logs": cmd_logs, "upgrade": cmd_upgrade}[args.cmd](st, args)
     except Refused as exc:
-        print("mg: %s（什么都没起）" % exc, file=sys.stderr)
+        print("mg: %s（%s）" % (exc, "什么都没动" if args.cmd == "upgrade" else "什么都没起"), file=sys.stderr)
         return 1
 
 
