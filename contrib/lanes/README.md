@@ -12,7 +12,9 @@ mg cx <站>                     # Codex 经这个网关开新会话
 mg cx <站> -r <id>             # 续会话
 mg env <站>                    # 给别的工具用的 export 行
 mg web <站>                    # 浏览器里开管理台（带口令登录）
-mg new <站>                    # 新网关：端口、目录、口令都给好
+mg new <站> --note …           # 按规矩建新网关：端口、目录、环境、口令都给好
+mg check                       # 按规矩核全部网关、探健康（只读）
+mg autostart <站> [--off]      # 登录时自启（只写 LaunchAgent）
 mg logs <站> -n 60
 mg upgrade                     # 管理台换成最新 release（零连接才重启；网关不碰）
 ```
@@ -64,14 +66,36 @@ stations.yml 默认读客户端双击时读的那份（app 的 LSEnvironment）�
 ### 加第 N 个网关
 
 ```sh
-mg new work                      # 端口从 3500 起每次 +10，页面端口 = 网关 +1
-# 管理台里加上游 provider 和 key：
-mg web work
+mg new work --note "接 X 上游，给 Y 用"   # 按下面的规矩建；接生产流量的加 --protected
+mg web work                      # 管理台里加上游 provider 和 key
 mg up work
+mg check work                    # 核规矩、探健康
 # Claude Code 要一个 profile：网关的 Gateway keys 页建一个调用 key，
 # 复制现有 profile，ANTHROPIC_BASE_URL 改成新网关、ANTHROPIC_AUTH_TOKEN 改成那个 key
 mg cc work -k work-s1 --print    # 先看一眼
 ```
+
+### 新网关的规矩
+
+照本机在跑的四个生产网关（linxi、baibei、agentrouter-a、agentrouter-b）量出来的。
+`mg new` 只按这张表建，建完从 `magpie station ls --json` 回读，逐条核对；`mg check`
+拿同一张表核每个网关（只读，什么都不改，不打印任何 key）。规矩写在 `mg` 的
+「新网关的规矩」一节，改规矩就两处一起改。
+
+| 项 | 规矩 | 由谁守 |
+|---|---|---|
+| 命名 | 小写字母、数字、`-`，字母开头，2–32 个字符 | `mg new` 拒绝 |
+| 端口 | 网关 xx45、页面 xx46，每加一个 +10（3445、3455、3465…）；不写 `--port` 取下一对清单里没人要、本机也没人在听的 | `mg new` 拒绝格外、被占的 |
+| 目录 | stations.yml 的 `root/<名>`，0700；缓存在 `<目录>-cache` | 不收 `--dir`；`mg check` 核权限 |
+| 密钥 | 页面口令在目录里的 `station-secrets.json`（0600），或明写的 `keyFile`；上游 key 只在它自己的管理台里加。stations.yml 的 env、备注里不放 key | `mg check` 发现像 key 的值就报（不打印值） |
+| 必带环境 | 六个代理变量去掉（值写 `''`）；`NO_PROXY`/`no_proxy` 含 `127.0.0.1,localhost,::1`（`--no-proxy` 或 `[rules] no_proxy` 加主机，放回环前）；`MAGPIE_NO_ACCOUNTS=1` | `mg new` 写入，回读核对 |
+| 备注 | 必填：接什么上游、给谁用 | `mg new` 拒绝 |
+| 受保护 | 接生产流量的加 `--protected`：站点页不能停，`mg down` 要 `--force` | `magpie station` |
+| 健康 | 在跑的：网关 `GET /v1/models` 要 200（本机回环不校验 key），页面有 HTTP 回应（未登录 401 算活着） | `mg check` |
+| 日志 | `<目录>/serve.log`；`mg logs <站>` 抹掉口令再看 | `magpie station start` |
+| 开机自启（可选） | `--autostart` 或 `mg autostart <站>`：只写 `~/Library/LaunchAgents/com.lzhs1995.magpie-station.<名>.plist`，跑 `magpie station start <名>`，下次登录生效；已在服务就不动。`--off` 删掉 | 不 `launchctl`，现在在跑的不动 |
+
+`mg new` 不收 `--dir`、`--web-port`、`--no-web`：目录和页面端口由规矩定。
 
 ### 升级管理台：mg upgrade
 
