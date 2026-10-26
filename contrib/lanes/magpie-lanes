@@ -742,9 +742,9 @@ CLIENT_RECIPES = {
         # Claude Code(ANTHROPIC_BASE_URL=http://127.0.0.1:<临时口>)
         #   → sanitizer(--upstream http://127.0.0.1:3455) → magpie lane
         # 两处都是**不带** /v1 的裸 host:port。
-        "note": "Claude Code 读 ANTHROPIC_BASE_URL，填裸 host:port，不要加 /v1 —— "
-                "客户端自己会接 /v1/messages。"
-                "本机现有会话是经 sanitizer 代理再进 lane 的；下面这条是直连。",
+        "note": "注意：~/.claude/settings.json 的 env 块写了 ANTHROPIC_BASE_URL 时，"
+                "shell 里 export 的会被它盖掉，下面这条不生效 —— 用 mg cc <站> -k <key>"
+                "（走 --settings profile，并核 profile 打给的网关和带的 key）。",
         "cmd": lambda lane: [
             "env", "ANTHROPIC_BASE_URL=http://127.0.0.1:%d" % lane.gateway_port,
             "NO_PROXY=127.0.0.1,localhost,::1",
