@@ -219,8 +219,11 @@ func Free(port int) bool {
 }
 
 // FirstPort is where a new station's ports are looked for from, unless
-// the reader says otherwise: the page's setting starts here too.
-const FirstPort = 3500
+// the reader says otherwise: the page's setting starts here too. In tens
+// from here a station's gateway is on an xx45 and its page on the xx46
+// after it, as the four started by hand are (contrib/lanes: mg new's
+// rules), so a station the + makes is on the same grid.
+const FirstPort = 3445
 
 // NextPort is a port no station in list has, from start upwards, and free
 // now. step apart keeps a station's gateway and page from the next
