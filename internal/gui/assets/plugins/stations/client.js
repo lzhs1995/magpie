@@ -123,6 +123,12 @@ magpie.plugin("stations", (ctx) => {
     const rows = el("div", "st-rows");
     rows.append(copyRow("Start it with", s.launch));
     rows.append(copyRow("Point a client at", s.baseURL));
+    // a client opened through it, a line each (internal/stations
+    // ClientLines): contrib/lanes/mg checks the client is pointed here and
+    // carries this station's own key before it starts it
+    for (const c of s.clients || []) {
+      rows.append(copyRow(c.client === "codex" ? "Open Codex with" : "Open Claude Code with", c.line));
+    }
     rows.append(copyRow("Settings folder", s.folder));
     // the same start written out, for a reader who wants no stations.yml
     // in it: folded away, since the short line is what they normally keep

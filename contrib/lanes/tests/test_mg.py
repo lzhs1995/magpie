@@ -165,6 +165,9 @@ class ClaudeCode(MgTest):
 
     def test_one_profile_is_taken_without_k(self):
         (self.profiles / "linxi-s2.json").unlink()
+        # 站点页不列的也不自动选：隐藏的、_模板、-k 收不了的名字
+        for name in (".linxi-old", "_template", "linxi copy"):
+            self.profile(name, "http://127.0.0.1:3945", "sk-linxi-one-0000000000")
         r = self.mg("cc", "linxi")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.ran("cc-stand-in")["argv"], ["--settings", str(self.profiles / "linxi-s1.json")])
