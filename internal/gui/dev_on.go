@@ -109,6 +109,7 @@ func devPage(next http.Handler) http.Handler {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		b = withPluginClients(b) // pluginclients.go
 		b = bytes.Replace(b, []byte("</body>"), []byte(`<script src="/dev.js"></script></body>`), 1)
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 		rw.Write(b)
