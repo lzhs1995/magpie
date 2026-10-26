@@ -856,6 +856,7 @@ var pageFile = regexp.MustCompile(`(src|href)="([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-
 // named with its content's hash; one not among the page's files (boot.js,
 // which the API writes) keeps its name.
 func versionedPage(page []byte) []byte {
+	page = withPluginClients(page) // pluginclients.go
 	return pageFile.ReplaceAllFunc(page, func(m []byte) []byte {
 		g := pageFile.FindSubmatch(m)
 		b, err := fs.ReadFile(staticFS(), string(g[2]))

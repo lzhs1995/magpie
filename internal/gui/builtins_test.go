@@ -259,6 +259,9 @@ func TestBuiltinClientsLoaded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// with the files a plugin's manifest adds as the page is served
+	// (pluginclients.go), not only those index.html names
+	page = withPluginClients(page)
 	src := string(page)
 	at := func(name string) int {
 		tag := `<script src="` + name + `"></script>`
@@ -321,6 +324,15 @@ func TestBuiltinsTranslated(t *testing.T) {
 		}
 		block, _, _ = strings.Cut(block, "\n  },")
 		for _, m := range pluginrt.Registered() {
+			// or the plugin's own i18n.js says it (magpie.strings), which
+			// the page loads before anything is translated
+			block := block
+			if own, err := os.ReadFile(filepath.Join("assets/plugins", m.ID, "i18n.js")); err == nil {
+				if _, b, ok := strings.Cut(string(own), "\n  "+lang+"\n"); ok {
+					b, _, _ = strings.Cut(b, "\n  },")
+					block += "\n" + b
+				}
+			}
 			says := []string{m.Name, m.Sub, m.One, m.Many}
 			if sc := m.Schema(); sc != nil {
 				for _, p := range sc.Properties {
