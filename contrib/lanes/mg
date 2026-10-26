@@ -10,7 +10,10 @@
                                   Codex 经这个网关：新会话 / 续会话
     mg env <站> [--json]          给别的工具用的 export 行
     mg web <站> [--print]         浏览器里开它的管理台（带口令登录）
-    mg new <站> [--port N] [--note …]   建一个新网关（端口、目录、口令都给好）
+    mg new <站> --note … [--port N] [--protected] [--no-proxy 主机] [--autostart]
+                                  按规矩建一个新网关（端口、目录、环境、口令都给好）
+    mg check [<站>]               按规矩核网关、探健康（只读）
+    mg autostart <站> [--off]     登录时自动起它（LaunchAgent）/ 关掉
     mg logs <站> [-n N]           看它的 serve.log（抹掉口令）
     mg upgrade [--check] [--wait 秒]   管理台换成最新的 stations-* release
                                   （核 SHA；只在管理台零连接时重启它；网关不碰）
@@ -40,6 +43,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -87,7 +91,8 @@ def load_config():
     known = {"magpie": {"binary", "stations"},
              "claude": {"launcher", "profiles"},
              "codex": {"launcher", "provider", "home"},
-             "upgrade": {"repo", "min_free_gb"}}
+             "upgrade": {"repo", "min_free_gb"},
+             "rules": {"first_port", "no_proxy"}}
     for cand in (os.environ.get("MG_CONFIG"),
                  str(Path.home() / ".config" / "magpie-stations" / "mg.toml"),
                  str(HERE / "mg.toml")):
@@ -519,14 +524,233 @@ def cmd_web(st, args):
     return 0
 
 
+# -------------------------------------------------------------------- 新网关的规矩
+# 照本机在跑的四个生产网关量出来的（stations.yml，2026-10-26）。mg new 只按这张表建，
+# mg check 拿它核每一个网关。改规矩 = 改这里和 README「新网关的规矩」，两处一起改。
+RULE_NAME = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
+RULE_FIRST_PORT = 3445  # 网关 xx45、页面 xx46
+RULE_STEP = 10          # 每加一个 +10
+PROXY_VARS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy")
+HOST = re.compile(r"^[A-Za-z0-9*][A-Za-z0-9.*:-]*$")
+AUTOSTART_PREFIX = "com.lzhs1995.magpie-station."
+
+
+def rules(cfg):
+    """[rules] 能改的只有起始端口和额外不走代理的主机；其余是规矩本身，不给改。"""
+    r = cfg.get("rules", {})
+    first = r.get("first_port", RULE_FIRST_PORT)
+    if not isinstance(first, int) or isinstance(first, bool) or not 1024 <= first <= 65000 or first % 10 != 5:
+        raise Refused("[rules] first_port 要是 1024–65000 之间、个位是 5 的整数（网关 xx45、页面 xx46），不是 %r" % (first,))
+    extra = r.get("no_proxy", [])
+    if not isinstance(extra, list) or not all(isinstance(h, str) and HOST.match(h) for h in extra):
+        raise Refused("[rules] no_proxy 是主机名列表，如 [\"k40.example.cn\"]，不是 %r" % (extra,))
+    return first, extra
+
+
+def rule_env(extra_hosts):
+    """新网关必带的环境：六个代理变量去掉（值写空 = 去掉），NO_PROXY 带回环，不读本机 agent 的登录。"""
+    env = {k: "" for k in PROXY_VARS}
+    env["NO_PROXY"] = env["no_proxy"] = ",".join(dict.fromkeys([*extra_hosts, *LOOPBACK]))
+    env["MAGPIE_NO_ACCOUNTS"] = "1"
+    return env
+
+
+def port_free(port):
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def on_grid(port, first):
+    return first <= port <= 65534 and (port - first) % RULE_STEP == 0
+
+
+def next_ports(stations, first):
+    """从 first 起每次 +10，第一对清单里没人要、本机也没人在听的端口。"""
+    taken = {p for s in stations for p in (s.get("port"), s.get("webPort")) if p}
+    for p in range(first, 65535, RULE_STEP):
+        if p not in taken and p + 1 not in taken and port_free(p) and port_free(p + 1):
+            return p
+    raise Refused("从 %d 起找不到一对空闲端口" % first)
+
+
+def audit(s, root, first):
+    """s 不合规矩的每一条，空 = 合规。只读，什么都不改；不打印任何值，免得把 key 印出来。"""
+    bad = []
+    if not RULE_NAME.match(s["name"]):
+        bad.append("名字不合规矩：小写字母、数字、-，字母开头，2–32 个字符")
+    port, web = s.get("port") or 0, s.get("webPort") or 0
+    if not on_grid(port, first):
+        bad.append("网关端口 %d 不在端口格上（%d 起每次 +%d）" % (port, first, RULE_STEP))
+    if web != port + 1:
+        bad.append("页面端口是 %s，规矩是网关 +1 = %d" % (web or "无", port + 1))
+    folder = s.get("folder") or ""
+    if os.path.realpath(folder) != os.path.realpath(os.path.join(root, s["name"])):
+        bad.append("目录 %s 不是 %s" % (folder, os.path.join(root, s["name"])))
+    env = s.get("env") or {}
+    left = [k for k in PROXY_VARS if env.get(k) != ""]
+    if left:
+        bad.append("env 没去掉代理变量 %s（值写 '' 即去掉）" % ", ".join(left))
+    for k in ("NO_PROXY", "no_proxy"):
+        miss = [h for h in LOOPBACK if h not in (env.get(k) or "").split(",")]
+        if miss:
+            bad.append("env 的 %s 缺回环 %s" % (k, ", ".join(miss)))
+    if env.get("MAGPIE_NO_ACCOUNTS") != "1":
+        bad.append("env 没有 MAGPIE_NO_ACCOUNTS=1（会读本机 agent 的登录）")
+    leaked = sorted(k for k, v in env.items() if redact(v) != v)
+    if leaked:
+        bad.append("env 的 %s 像是 key：key 不进 stations.yml" % ", ".join(leaked))
+    note = s.get("note") or ""
+    if not note.strip():
+        bad.append("没有备注（接什么上游、给谁用）")
+    elif redact(note) != note:
+        bad.append("备注里像是有 key")
+    # 页面口令：自己目录里的 station-secrets.json，或明写的 keyFile；目录和口令文件都只许本人读写
+    for what, path, want in (("目录", folder, 0o700),
+                             ("口令文件", s.get("keyFile") or os.path.join(folder, "station-secrets.json"), 0o600)):
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except FileNotFoundError:
+            bad.append("%s %s 不存在" % (what, path))
+            continue
+        if mode & 0o077:
+            bad.append("%s %s 权限是 %o，规矩是 %o" % (what, path, mode, want))
+    return bad
+
+
+def health(s):
+    """在跑的才探：网关 GET /v1/models 要 200（本机回环不校验 key），页面要有 HTTP 回应。"""
+    if s.get("state") != "up":
+        return "没在跑（%s）" % s.get("state"), True
+    out, ok_all = [], True
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for what, url, ok in (("网关", s["baseURL"] + "/v1/models", lambda c: c == 200),
+                          ("页面", s.get("webURL"), lambda c: c < 500)):
+        if not url:
+            continue
+        try:
+            with opener.open(url, timeout=5) as r:
+                code = r.status
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        except (urllib.error.URLError, OSError) as exc:
+            out.append("%s连不上（%s）" % (what, getattr(exc, "reason", exc)))
+            ok_all = False
+            continue
+        out.append("%s %d%s" % (what, code, "" if ok(code) else " ✗"))
+        ok_all = ok_all and ok(code)
+    return " · ".join(out), ok_all
+
+
+def autostart_plist(name):
+    return Path.home() / "Library" / "LaunchAgents" / (AUTOSTART_PREFIX + name + ".plist")
+
+
+def write_autostart(st, s):
+    """登录时起它：一个只跑 `magpie station start <站>` 的 LaunchAgent。只写文件，不 launchctl
+    ——下次登录才生效，现在在跑的什么都不动。station start 见它已在服务就不动。"""
+    path = autostart_plist(s["name"])
+    plist = {"Label": path.stem, "ProgramArguments": [st.binary, "station", "start", s["name"]],
+             "EnvironmentVariables": {"MAGPIE_STATIONS": st.file} if st.file else {},
+             "RunAtLoad": True, "AbandonProcessGroup": True,
+             "StandardOutPath": os.path.join(s["folder"], "autostart.log"),
+             "StandardErrorPath": os.path.join(s["folder"], "autostart.log")}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("wb") as fh:
+        plistlib.dump(plist, fh)
+    os.replace(tmp, path)
+    return path
+
+
 def cmd_new(st, args):
-    flags = []
-    for flag, val in (("--port", args.port), ("--web-port", args.web_port), ("--note", args.note), ("--dir", args.dir)):
-        if val is not None:
-            flags += [flag, str(val)]
-    if args.no_web:
-        flags.append("--no-web")
-    return st.run("new", args.station, *flags).returncode
+    first, extra = rules(st.cfg)
+    name, note = args.station, (args.note or "").strip()
+    if not RULE_NAME.match(name):
+        raise Refused("网关名只用小写字母、数字和 -，字母开头，2–32 个字符（像 linxi、agentrouter-a），不是 %r" % name)
+    if not note:
+        raise Refused("--note 必填：写这个网关接什么上游、给谁用（mg ls 和站点页上会显示）")
+    hosts = list(extra) + list(args.no_proxy or [])
+    bad_host = [h for h in hosts if not HOST.match(h)]
+    if bad_host:
+        raise Refused("--no-proxy 是主机名，不是 %r" % bad_host[0])
+    data = st.listing()
+    if any(s["name"] == name for s in data["stations"]):
+        raise Refused("%s 里已经有 %s" % (data["path"], name))
+    if args.port is None:
+        port = next_ports(data["stations"], first)
+    else:
+        port = args.port
+        if not on_grid(port, first):
+            raise Refused("--port %d 不在端口格上：网关是 %d、%d、%d…（每次 +%d），页面是网关 +1"
+                          % (port, first, first + RULE_STEP, first + 2 * RULE_STEP, RULE_STEP))
+        mine = {p: s["name"] for s in data["stations"] for p in (s.get("port"), s.get("webPort")) if p}
+        for p in (port, port + 1):
+            if p in mine:
+                raise Refused("端口 %d 已经是 %s 的" % (p, mine[p]))
+            if not port_free(p):
+                raise Refused("端口 %d 有别的程序在听" % p)
+    flags = ["--port", str(port), "--web-port", str(port + 1), "--note", note]
+    if args.protected:
+        flags.append("--protected")
+    for k, v in rule_env(hosts).items():
+        flags += ["--env", "%s=%s" % (k, v)]
+    rc = st.run("new", name, *flags).returncode
+    if rc != 0:
+        return rc
+    # 回读：magpie 写进 stations.yml 的，必须正是规矩要的
+    data, s = st.find(name)
+    bad = audit(s, data["root"], first)
+    if bad:
+        for b in bad:
+            print("mg: ✗ %s" % b, file=sys.stderr)
+        print("mg: %s 已写进 %s，但和规矩不一致（见上）：站点页里改，或删掉重建" % (name, data["path"]), file=sys.stderr)
+        return 1
+    auto = write_autostart(st, s) if args.autostart else None
+    print("  规矩    端口 %d/%d · 目录 0700 · 页面口令 %s（0600）"
+          % (port, port + 1, os.path.join(s["folder"], "station-secrets.json")))
+    print("  上游    provider 和 key 只在它自己的管理台里加：mg web %s（不写进 stations.yml）" % name)
+    print("  日志    %s" % os.path.join(s["folder"], "serve.log"))
+    print("  健康    mg check %s（网关 GET /v1/models 要 200）" % name)
+    print("  自启    %s" % (("%s（下次登录生效）" % auto) if auto else "没开（要的话 mg autostart %s）" % name))
+    return 0
+
+
+def cmd_check(st, args):
+    first, _extra = rules(st.cfg)
+    data = st.listing()
+    rows = data["stations"] if args.station is None else [st.find(args.station)[1]]
+    problems = 0
+    for s in rows:
+        bad = audit(s, data["root"], first)
+        text, healthy = health(s)
+        auto = autostart_plist(s["name"])
+        print("%s%s" % (s["name"], "（受保护）" if s.get("protected") else ""))
+        print("  健康  %s" % text)
+        print("  日志  %s" % os.path.join(s.get("folder") or "", "serve.log"))
+        print("  自启  %s" % (auto if auto.exists() else "没开"))
+        for b in bad:
+            print("  ✗ %s" % b)
+        problems += len(bad) + (0 if healthy else 1)
+    print("\n%s · 规矩见 README「新网关的规矩」· 只读，什么都没改" % ("全部合规矩" if not problems else "%d 处不合" % problems))
+    return 1 if problems else 0
+
+
+def cmd_autostart(st, args):
+    _data, s = st.find(args.station)
+    path = autostart_plist(s["name"])
+    if args.off:
+        if path.exists():
+            path.unlink()
+            print("已删 %s：下次登录不再自启 %s。现在在跑的不动。" % (path, s["name"]))
+        else:
+            print("%s 本来就没开自启" % s["name"])
+        return 0
+    print("已写 %s：下次登录时起 %s（已在服务就不动）。现在在跑的不动。" % (write_autostart(st, s), s["name"]))
+    return 0
 
 
 def cmd_logs(st, args):
@@ -1017,13 +1241,18 @@ def parser():
     c = cmd("web", "浏览器里开管理台")
     c.add_argument("station")
     c.add_argument("--print", action="store_true", help="只打印链接")
-    c = cmd("new", "建网关")
+    c = cmd("new", "按规矩建网关")
     c.add_argument("station")
-    c.add_argument("--port", type=int)
-    c.add_argument("--web-port", type=int)
-    c.add_argument("--no-web", action="store_true")
-    c.add_argument("--note")
-    c.add_argument("--dir")
+    c.add_argument("--note", help="必填：接什么上游、给谁用")
+    c.add_argument("--port", type=int, help="网关端口，须在端口格上；不写取下一对空闲的")
+    c.add_argument("--protected", action="store_true", help="接生产流量的：mg down 要 --force，站点页不能停")
+    c.add_argument("--no-proxy", action="append", metavar="主机", help="除回环外也不走代理的主机，可写多次")
+    c.add_argument("--autostart", action="store_true", help="登录时自动起它（只写 LaunchAgent，不立即起）")
+    c = cmd("check", "按规矩核网关、探健康（只读）")
+    c.add_argument("station", nargs="?")
+    c = cmd("autostart", "登录自启：开 / --off 关")
+    c.add_argument("station")
+    c.add_argument("--off", action="store_true")
     c = cmd("logs", "看日志")
     c.add_argument("station")
     c.add_argument("-n", "--lines", type=int, default=40)
@@ -1052,9 +1281,11 @@ def main(argv):
         if args.cmd in ("cc", "cx"):
             return (cmd_cc if args.cmd == "cc" else cmd_cx)(st, args, extra, warn)
         return {"ls": cmd_ls, "up": cmd_up, "down": cmd_down, "env": cmd_env,
-                "web": cmd_web, "new": cmd_new, "logs": cmd_logs, "upgrade": cmd_upgrade}[args.cmd](st, args)
+                "web": cmd_web, "new": cmd_new, "logs": cmd_logs, "upgrade": cmd_upgrade,
+                "check": cmd_check, "autostart": cmd_autostart}[args.cmd](st, args)
     except Refused as exc:
-        print("mg: %s（%s）" % (exc, "什么都没动" if args.cmd == "upgrade" else "什么都没起"), file=sys.stderr)
+        print("mg: %s（%s）" % (exc, "什么都没动" if args.cmd in ("upgrade", "new", "check", "autostart") else "什么都没起"),
+              file=sys.stderr)
         return 1
 
 
